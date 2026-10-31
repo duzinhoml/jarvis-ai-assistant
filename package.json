@@ -1,0 +1,22 @@
+{
+  "name": "jarvis",
+  "version": "1.0.0",
+  "main": "src/main.ts",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@ozymandiasthegreat/vad": "^2.0.7",
+    "ollama": "^0.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
