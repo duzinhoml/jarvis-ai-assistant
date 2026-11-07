@@ -27,18 +27,19 @@ export const startVoiceController = async (): Promise<void> => {
 
   const buffers = createAudioBuffers();
   const MAX_BUFFER_BYTES = 16000 * 2 * 3;
-  let pendingBytes = 0;
-  const MAX_PENDING_BYTES = 16000 * 2 * 5;
   let totalBytes = 0;
+  const MAX_PENDING_BYTES = 16000 * 2 * 5;
+  let pendingBytes = 0;
   let commandBytes = 0;
 
   let isShuttingDown = false;
 
   const MAX_LISTENING_MS = 10000;
+  const FIRST_COMMAND_TIMEOUT_MS = 4000;
   let listeningStart: number | null = null;
   let silenceHandled = false;
-
   let isTranscribing = false;
+  let idleSpeechDetected: boolean = false;
 
   const SPEECH_COOLDOWN_MS = 1000;
   let cooldownUntil = 0;
@@ -58,8 +59,10 @@ export const startVoiceController = async (): Promise<void> => {
       Date.now() < cooldownUntil ||
       state === "PROCESSING" ||
       state === "SPEAKING"
-    )
+    ) {
       return;
+    }
+
     if (isTranscribing && state === "IDLE") {
       buffers.pending.push(chunk);
       pendingBytes += chunk.length;
@@ -92,12 +95,14 @@ export const startVoiceController = async (): Promise<void> => {
       );
 
       const result = vad.processFrame(samples);
-      // if (result === VADEvent.VOICE) console.log("VAD: VOICE");
-      // else if (result === VADEvent.SILENCE) console.log("VAD: SILENCE");
-      // else if (result === VADEvent.ERROR) console.error("VAD: ERROR");
+
+      if (state === "IDLE" && result === VADEvent.VOICE) {
+        idleSpeechDetected = true;
+      }
 
       if (state === "LISTENING") {
         if (result === VADEvent.VOICE) {
+          if (!vadVoiceDetected) listeningStart = Date.now();
           vadSilentFrames = 0;
           vadVoiceDetected = true;
         } else if (result === VADEvent.SILENCE) vadSilentFrames++;
@@ -112,6 +117,18 @@ export const startVoiceController = async (): Promise<void> => {
     const maxListeningElapsed: boolean =
       listeningStart !== null &&
       Date.now() - listeningStart >= MAX_LISTENING_MS;
+
+    const firstCommandTimeoutElapsed: boolean =
+      state === "LISTENING" &&
+      !vadVoiceDetected &&
+      listeningStart !== null &&
+      Date.now() - listeningStart >= FIRST_COMMAND_TIMEOUT_MS;
+
+    if (firstCommandTimeoutElapsed) {
+      resetListeningSession();
+      console.log("First-command timeout: Returning to IDLE");
+      return;
+    }
 
     if (
       !silenceHandled &&
@@ -143,6 +160,9 @@ export const startVoiceController = async (): Promise<void> => {
       return;
     }
 
+    if (!idleSpeechDetected) return;
+
+    idleSpeechDetected = false;
     isTranscribing = true;
     const checkSessionId = sessionId;
     buffers.pending.length = 0;
@@ -186,12 +206,29 @@ export const startVoiceController = async (): Promise<void> => {
     }
   };
 
+  const resetListeningSession = (): void => {
+    sessionId++;
+    resetAudioBuffers(buffers);
+    commandBytes = 0;
+    totalBytes = 0;
+    pendingBytes = 0;
+    silenceHandled = false;
+    listeningStart = null;
+    state = "IDLE";
+    cooldownUntil = Date.now() + SPEECH_COOLDOWN_MS;
+    vadSilentFrames = 0;
+    vadVoiceDetected = false;
+    idleSpeechDetected = false;
+  };
+
   const processCommand = async (): Promise<void> => {
     try {
       const pcmBuffer = Buffer.concat(buffers.command);
       const wavBuffer = createWavBuffer(pcmBuffer);
       await writeFile("command.wav", wavBuffer);
       const transcription = await transcribeAudio("command.wav");
+
+      console.log("Raw command transcription:", JSON.stringify(transcription));
 
       const cleanedTranscription = transcription
         .replace(/^jarvis\b[,.!?]*\s*/i, "")
@@ -242,20 +279,10 @@ export const startVoiceController = async (): Promise<void> => {
       } catch (error) {
         console.error("Unable to delete command.wav:", error);
       }
-
-      sessionId++;
-      resetAudioBuffers(buffers);
-      commandBytes = 0;
-      totalBytes = 0;
-      pendingBytes = 0;
-      silenceHandled = false;
-      listeningStart = null;
-      state = "IDLE";
-      cooldownUntil = Date.now() + SPEECH_COOLDOWN_MS;
-      vadSilentFrames = 0;
-      vadVoiceDetected = false;
-
-      console.log("JARVIS is ready for another command");
+      if (!isShuttingDown) {
+        resetListeningSession();
+        console.log("JARVIS is ready for another command");
+      }
     }
   };
 
@@ -266,6 +293,7 @@ export const startVoiceController = async (): Promise<void> => {
     clearInterval(wakeInterval);
 
     console.log("Shutting down voice controller...");
+
     child.kill("SIGTERM");
   });
 
@@ -275,7 +303,7 @@ export const startVoiceController = async (): Promise<void> => {
       if (isShuttingDown) return;
       console.error("Wake-word check failed:", error);
     });
-  }, 2000);
+  }, 1000);
 
   child.on("error", (error) => {
     isShuttingDown = true;
