@@ -1,9 +1,9 @@
 import { KokoroTTS } from "kokoro-js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { execFile, type ChildProcess } from "node:child_process";
 import { unlink } from "node:fs/promises";
 
-const execFileAsync = promisify(execFile);
+let activePlayback: ChildProcess | null = null;
+let interruptPlayback: (() => void) | null = null;
 
 let ttsPromise: Promise<KokoroTTS> | null = null;
 
@@ -38,7 +38,42 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
 
   try {
     await audio.save(output);
-    await execFileAsync("afplay", [output]);
+
+    await new Promise<void>((resolve, reject) => {
+      let wasInterrupted = false;
+
+      const child = execFile("afplay", [output]);
+      activePlayback = child;
+
+      interruptPlayback = () => {
+        wasInterrupted = true;
+        child.kill("SIGTERM");
+      };
+
+      child.on("close", (code, signal) => {
+        if (activePlayback === child) {
+          activePlayback = null;
+          interruptPlayback = null;
+        }
+
+        if (wasInterrupted || signal === "SIGINT") resolve();
+        else if (code === 0) resolve();
+        else
+          reject(
+            new Error(`afplay exited with code ${code}, signal ${signal}`),
+          );
+      });
+
+      child.on("error", (error) => {
+        if (activePlayback === child) {
+          activePlayback = null;
+          interruptPlayback = null;
+        }
+
+        if (wasInterrupted) resolve();
+        else reject(error);
+      });
+    });
   } finally {
     try {
       await unlink(output);
@@ -46,4 +81,8 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
       console.error("Failed to delete Kokoro audio:", error);
     }
   }
+};
+
+export const stopKokoroPlayback = (): void => {
+  interruptPlayback?.();
 };

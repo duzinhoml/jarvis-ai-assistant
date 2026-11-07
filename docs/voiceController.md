@@ -11,6 +11,7 @@ Its main responsibilities are:
 - Receive continuous audio from the microphone.
 - Detect speech using Voice Activity Detection (VAD).
 - Recognize the "Jarvis" wake word using Whisper.
+- Support barge-in by detecting the wake word and interrupting ongoing speech output.
 - Preserve audio while asynchronous transcription is running.
 - Record commands and determine when the user finishes speaking.
 - Manage listening states, timeouts, and session resets.
@@ -57,18 +58,22 @@ The history initially contains the system prompt. The controller passes it to `p
 let state: ListeningState = "IDLE";
 ```
 
-| State        | Responsibility                                |
-| ------------ | --------------------------------------------- |
-| `IDLE`       | Wait for the wake word                        |
-| `LISTENING`  | Record the user's command                     |
-| `PROCESSING` | Transcribe, classify, and execute the request |
-| `SPEAKING`   | Deliver JARVIS's response                     |
+| State        | Responsibility                                                               |
+| ------------ | ---------------------------------------------------------------------------- |
+| `IDLE`       | Wait for the wake word                                                       |
+| `LISTENING`  | Record the user's command                                                    |
+| `PROCESSING` | Transcribe, classify, and execute the request                                |
+| `SPEAKING`   | Deliver JARVIS's response (wake-word detection remains active for barge-in)  |
 
 Typical interaction:
 
 `IDLE → LISTENING → PROCESSING → SPEAKING → IDLE`
 
-The controller uses these states to determine how incoming microphone audio should be handled.
+**Barge-in interaction:**
+
+`SPEAKING → (Wake Word Detected) → LISTENING`
+
+The controller uses these states to determine how incoming microphone audio should be handled. Audio processing remains active during `SPEAKING` so users can interrupt JARVIS mid-sentence.
 
 ---
 
@@ -187,7 +192,9 @@ let sessionId = 0;
 
 `sessionId` identifies the current listening session.
 
-When a session resets, its ID increments. An asynchronous transcription can compare its original session ID against the current one to avoid applying outdated results.
+When a session resets or when playback is interrupted via barge-in (`state === "SPEAKING"`), `sessionId` increments:
+- An asynchronous wake-word transcription compares its captured `checkSessionId` against `sessionId` to avoid applying outdated detections.
+- An in-flight command execution checks `commandSessionId === sessionId` before running error-handling speech or session cleanup, ensuring a superseded session never overwrites an active interruption.
 
 ### Session Reset (`resetListeningSession`)
 
@@ -271,19 +278,38 @@ A `Buffer` contains raw bytes representing audio samples.
 
 ### When Audio Is Ignored
 
+```ts
+if (
+  isShuttingDown ||
+  Date.now() < cooldownUntil ||
+  state === "PROCESSING"
+) {
+  return;
+}
+```
+
 The handler returns early when:
 
 - JARVIS is shutting down.
 - The speech cooldown is active.
 - JARVIS is in `PROCESSING`.
-- JARVIS is in `SPEAKING`.
 
-This prevents unnecessary recording and processing during those conditions.
+**Note:** Audio is **not** ignored during `SPEAKING`. Audio streaming and wake-word detection continue during speech playback to allow the user to interrupt JARVIS (barge-in).
+
+### Wake-Word Detection State (`canDetectWakeWord`)
+
+```ts
+const canDetectWakeWord = (): boolean => {
+  return state === "IDLE" || state === "SPEAKING";
+};
+```
+
+Encapsulates the states where JARVIS listens for the wake word: while waiting idle or while speaking a response.
 
 ### Buffering During Wake-Word Transcription
 
 ```ts
-if (isTranscribing && state === "IDLE") {
+if (isTranscribing && canDetectWakeWord()) {
   buffers.pending.push(chunk);
   pendingBytes += chunk.length;
 }
@@ -291,18 +317,18 @@ if (isTranscribing && state === "IDLE") {
 
 While Whisper checks for the wake word, the microphone continues recording.
 
-The `pending` buffer stores newly arriving audio so commands spoken during transcription aren't lost.
+The `pending` buffer stores newly arriving audio so commands spoken during transcription aren't lost (both while `IDLE` or `SPEAKING`).
 
 ### Maintaining the Wake Buffer
 
 ```ts
-if (state === "IDLE") {
+if (canDetectWakeWord()) {
   buffers.wake.push(chunk);
   totalBytes += chunk.length;
 }
 ```
 
-The wake buffer continually stores recent microphone audio.
+The wake buffer continually stores recent microphone audio whenever JARVIS is ready to detect the wake word (`IDLE` or `SPEAKING`).
 
 When it exceeds its byte limit, the oldest chunks are removed.
 
@@ -361,9 +387,9 @@ const result = vad.processFrame(samples);
 
 VAD analyzes the audio frame and returns a detection result.
 
-**While IDLE:**
+**While IDLE or SPEAKING (`canDetectWakeWord()`):**
 
-If VAD detects voice, `idleSpeechDetected` becomes `true`, allowing a subsequent wake-word check to invoke Whisper.
+If VAD detects voice, `idleSpeechDetected` becomes `true`, allowing a subsequent wake-word check to invoke Whisper (enabling wake-word recognition both in standby and during active speech).
 
 **While LISTENING:**
 
@@ -449,7 +475,75 @@ This prevents subsequent microphone events from repeatedly starting the same com
 
 ---
 
-## 8. Key Concepts to Remember
+## 8. Speech Barge-In and Playback Interruption
+
+### Overview
+
+Speech barge-in allows the user to say the wake word ("Jarvis") while JARVIS is actively speaking (`SPEAKING` state). This immediately interrupts the speech playback and transitions directly into recording a new command (`LISTENING` state).
+
+### Interruption Trigger
+
+```ts
+if (
+  containsWakeWord(transcription) &&
+  canDetectWakeWord() &&
+  !isShuttingDown &&
+  checkSessionId === sessionId
+) {
+  if (state === "SPEAKING") {
+    sessionId++;
+    stopKokoroPlayback();
+    buffers.command.length = 0;
+    commandBytes = 0;
+  }
+
+  buffers.command.push(pcmBuffer);
+  buffers.command.push(...buffers.pending);
+  commandBytes = Buffer.concat(buffers.command).length;
+  buffers.wake.length = 0;
+  totalBytes = 0;
+
+  state = "LISTENING";
+  listeningStart = Date.now();
+  // ...
+```
+
+When the wake word is confirmed while `state === "SPEAKING"`:
+
+1. **`sessionId++`**: Invalidates the prior session so that in-flight asynchronous operations or error handlers from that command cycle are disregarded.
+2. **`stopKokoroPlayback()`**: Sends `SIGTERM` to the active `afplay` child process in Kokoro TTS, cutting off speech playback immediately.
+3. **Buffer reset**: Discards prior command audio and seeds the new command buffer with the captured wake-word audio and any pending chunks.
+4. **Immediate listening**: Switches `state = "LISTENING"` and records the user's new request without requiring an idle transition or cooldown.
+
+### Guarding Command Processing (`commandSessionId`)
+
+```ts
+const processCommand = async (): Promise<void> => {
+  const commandSessionId = sessionId;
+
+  try {
+    // ... execute command and speak response
+  } catch (error) {
+    if (!isShuttingDown && commandSessionId === sessionId) {
+      // Speak error response
+    }
+  } finally {
+    // Clean up temporary audio files
+    if (!isShuttingDown && commandSessionId === sessionId) {
+      resetListeningSession();
+    }
+  }
+};
+```
+
+When barge-in interrupts a command:
+
+- The interrupted command's `processCommand` execution might be waiting on playback completion or error unwinding.
+- Checking `commandSessionId === sessionId` in `catch` and `finally` ensures an interrupted command cannot attempt to speak an error or reset the state machine to `IDLE` while the new command is actively being recorded in `LISTENING`.
+
+---
+
+## 9. Key Concepts to Remember
 
 **Audio chunks vs. audio frames**
 
@@ -462,6 +556,10 @@ VAD determines whether speech is present. Whisper converts recorded speech into 
 **Wake vs. pending vs. command**
 
 The wake buffer helps recognize "Jarvis"; the pending buffer preserves audio during transcription; the command buffer holds the complete audio for the user's request.
+
+**Speech barge-in**
+
+Microphone audio and VAD monitoring remain active while JARVIS speaks (`canDetectWakeWord()`). If the wake word is spoken during playback, JARVIS halts speech output immediately via `stopKokoroPlayback()`, increments `sessionId` to obsolete the prior command flow, and begins recording the new command right away.
 
 **Asynchronous execution**
 

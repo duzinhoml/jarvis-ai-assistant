@@ -9,6 +9,7 @@ import { speak } from "./speech.js";
 import { executeLocalCommand, classifyIntent } from "./commands/index.js";
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
 import { AudioFrameBuffer } from "./audio/frameBuffer.js";
+import { stopKokoroPlayback } from "./tts/kokoro.js";
 
 export const startVoiceController = async (): Promise<void> => {
   const child = startMicrophone();
@@ -53,17 +54,20 @@ export const startVoiceController = async (): Promise<void> => {
   let vadVoiceDetected = false;
   const VAD_SILENCE_FRAMES = 50;
 
+  const canDetectWakeWord = (): boolean => {
+    return state === "IDLE" || state === "SPEAKING";
+  };
+
   child.stdout.on("data", (chunk: Buffer) => {
     if (
       isShuttingDown ||
       Date.now() < cooldownUntil ||
-      state === "PROCESSING" ||
-      state === "SPEAKING"
+      state === "PROCESSING"
     ) {
       return;
     }
 
-    if (isTranscribing && state === "IDLE") {
+    if (isTranscribing && canDetectWakeWord()) {
       buffers.pending.push(chunk);
       pendingBytes += chunk.length;
       while (pendingBytes > MAX_PENDING_BYTES) {
@@ -73,7 +77,7 @@ export const startVoiceController = async (): Promise<void> => {
       }
     }
 
-    if (state === "IDLE") {
+    if (canDetectWakeWord()) {
       buffers.wake.push(chunk);
       totalBytes += chunk.length;
       while (totalBytes > MAX_BUFFER_BYTES) {
@@ -96,7 +100,7 @@ export const startVoiceController = async (): Promise<void> => {
 
       const result = vad.processFrame(samples);
 
-      if (state === "IDLE" && result === VADEvent.VOICE) {
+      if (canDetectWakeWord() && result === VADEvent.VOICE) {
         idleSpeechDetected = true;
       }
 
@@ -153,7 +157,7 @@ export const startVoiceController = async (): Promise<void> => {
   const checkWakeWord = async (): Promise<void> => {
     if (
       isTranscribing ||
-      state !== "IDLE" ||
+      !canDetectWakeWord() ||
       !buffers.wake.length ||
       Date.now() < cooldownUntil
     ) {
@@ -180,13 +184,22 @@ export const startVoiceController = async (): Promise<void> => {
 
       if (
         containsWakeWord(transcription) &&
-        state === "IDLE" &&
+        canDetectWakeWord() &&
         !isShuttingDown &&
         checkSessionId === sessionId
       ) {
+        if (state === "SPEAKING") {
+          sessionId++;
+          stopKokoroPlayback();
+          buffers.command.length = 0;
+          commandBytes = 0;
+        }
+
         buffers.command.push(pcmBuffer);
         buffers.command.push(...buffers.pending);
         commandBytes = Buffer.concat(buffers.command).length;
+        buffers.wake.length = 0;
+        totalBytes = 0;
 
         state = "LISTENING";
         listeningStart = Date.now();
@@ -222,13 +235,13 @@ export const startVoiceController = async (): Promise<void> => {
   };
 
   const processCommand = async (): Promise<void> => {
+    const commandSessionId = sessionId;
+
     try {
       const pcmBuffer = Buffer.concat(buffers.command);
       const wavBuffer = createWavBuffer(pcmBuffer);
       await writeFile("command.wav", wavBuffer);
       const transcription = await transcribeAudio("command.wav");
-
-      console.log("Raw command transcription:", JSON.stringify(transcription));
 
       const cleanedTranscription = transcription
         .replace(/^jarvis\b[,.!?]*\s*/i, "")
@@ -262,7 +275,7 @@ export const startVoiceController = async (): Promise<void> => {
         await speak(errorResponse);
       }
     } catch (error) {
-      if (!isShuttingDown) {
+      if (!isShuttingDown && commandSessionId === sessionId) {
         console.error("JARVIS command processing failed:", error);
         try {
           state = "SPEAKING";
@@ -279,7 +292,7 @@ export const startVoiceController = async (): Promise<void> => {
       } catch (error) {
         console.error("Unable to delete command.wav:", error);
       }
-      if (!isShuttingDown) {
+      if (!isShuttingDown && commandSessionId === sessionId) {
         resetListeningSession();
         console.log("JARVIS is ready for another command");
       }
