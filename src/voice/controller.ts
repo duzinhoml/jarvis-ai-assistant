@@ -1,15 +1,18 @@
-import { startMicrophone, type ListeningState } from "./microphone.js";
-import { createWavBuffer, systemPrompt } from "./utils/index.js";
-import { createAudioBuffers, resetAudioBuffers } from "./audioBuffer.js";
+import {
+  startMicrophone,
+  type ListeningState,
+  createAudioBuffers,
+  resetAudioBuffers,
+  AudioFrameBuffer,
+  createWavBuffer,
+} from "../audio/index.js";
+import { processMessage, systemPrompt } from "../conversation/index.js";
 import { writeFile, unlink } from "node:fs/promises";
-import { transcribeAudio } from "./transcription.js";
+import { transcribeAudio } from "../stt/transcription.js";
 import { containsWakeWord } from "./wakeWord.js";
-import { processMessage } from "./ai.js";
-import { speak } from "./speech.js";
-import { executeLocalCommand, classifyIntent } from "./commands/index.js";
+import { speak, stopKokoroPlayback } from "../tts/index.js";
+import { executeLocalCommand, classifyIntent } from "../commands/index.js";
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
-import { AudioFrameBuffer } from "./audio/frameBuffer.js";
-import { stopKokoroPlayback } from "./tts/kokoro.js";
 
 export const startVoiceController = async (): Promise<void> => {
   const child = startMicrophone();

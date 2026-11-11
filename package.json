@@ -11,7 +11,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@elevenlabs/elevenlabs-js": "^2.77.0",
     "@ozymandiasthegreat/vad": "^2.0.7",
+    "dotenv": "^18.0.10",
     "kokoro-js": "^1.2.1",
     "ollama": "^0.6.4"
   },

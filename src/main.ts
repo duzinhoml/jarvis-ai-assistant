@@ -1,4 +1,4 @@
-import { startVoiceController } from "./voiceController.js";
+import { startVoiceController } from "./voice/controller.js";
 
 const main = async (): Promise<void> => {
   console.log("Initializing J.A.R.V.I.S...");

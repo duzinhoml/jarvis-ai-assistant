@@ -1,5 +1,5 @@
 import ollama from "ollama";
-import { speak } from "./speech.js";
+import { speak } from "../tts/index.js";
 
 type Message = {
   role: "user" | "assistant" | "system";
