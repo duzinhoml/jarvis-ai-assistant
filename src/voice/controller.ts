@@ -9,9 +9,17 @@ import {
 import { processMessage, systemPrompt } from "../conversation/index.js";
 import { writeFile, unlink } from "node:fs/promises";
 import { transcribeAudio } from "../stt/transcription.js";
-import { containsWakeWord } from "./wakeWord.js";
-import { speak, stopKokoroPlayback } from "../tts/index.js";
-import { executeLocalCommand, classifyIntent } from "../commands/index.js";
+import { containsWakeWord, removeWakeWord } from "./wakeWord.js";
+import {
+  speak,
+  stopKokoroPlayback,
+  shutdownKokoroWorker,
+} from "../tts/index.js";
+import {
+  executeLocalCommand,
+  classifyIntent,
+  type LocalCommand,
+} from "../commands/index.js";
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
 
 export const startVoiceController = async (): Promise<void> => {
@@ -25,6 +33,8 @@ export const startVoiceController = async (): Promise<void> => {
   const conversationHistory: Message[] = [
     { role: "system", content: systemPrompt },
   ];
+
+  let lastCommand: LocalCommand | null = null;
 
   let state: ListeningState = "IDLE";
   console.log(state);
@@ -180,13 +190,11 @@ export const startVoiceController = async (): Promise<void> => {
       const wavBuffer = createWavBuffer(pcmBuffer);
       await writeFile("wakeSnapshot.wav", wavBuffer);
       const transcription = await transcribeAudio("wakeSnapshot.wav");
-      const cleanedWakeTranscription = transcription
-        .replace(/^jarvis\b[,.!?]*\s*/i, "")
-        .trim();
+      const cleanedWakeTranscription = removeWakeWord(transcription);
       const wakeContainsCommand = cleanedWakeTranscription.length > 0;
 
       if (
-        containsWakeWord(transcription) &&
+        containsWakeWord(transcription, state === "SPEAKING") &&
         canDetectWakeWord() &&
         !isShuttingDown &&
         checkSessionId === sessionId
@@ -239,35 +247,56 @@ export const startVoiceController = async (): Promise<void> => {
 
   const processCommand = async (): Promise<void> => {
     const commandSessionId = sessionId;
+    const commandFile = `command-${commandSessionId}.wav`;
 
     try {
       const pcmBuffer = Buffer.concat(buffers.command);
       const wavBuffer = createWavBuffer(pcmBuffer);
-      await writeFile("command.wav", wavBuffer);
-      const transcription = await transcribeAudio("command.wav");
+      await writeFile(commandFile, wavBuffer);
+      const transcription = await transcribeAudio(commandFile);
 
-      const cleanedTranscription = transcription
-        .replace(/^jarvis\b[,.!?]*\s*/i, "")
-        .trim();
+      const cleanedTranscription = removeWakeWord(transcription);
       if (cleanedTranscription.length === 0) {
         console.log("No valid command detected");
         return;
       }
       console.log("Cleaned command:", cleanedTranscription);
-      const classification = await classifyIntent(cleanedTranscription);
+
+      const normalizedCommand = cleanedTranscription
+        .toLowerCase()
+        .trim()
+        .replace(/[.!?]+$/, "");
+      if (normalizedCommand === "stop") return;
+
+      const classification = await classifyIntent(
+        cleanedTranscription,
+        lastCommand,
+      );
+      if (commandSessionId !== sessionId) return;
 
       if (classification.status === "COMMAND") {
         state = "SPEAKING";
         console.log("JARVIS is speaking...");
+
         const commandResponse = await executeLocalCommand(
           classification.command,
         );
+
+        if (commandSessionId !== sessionId) return;
+
+        lastCommand = classification.command;
+
         console.log(`J.A.R.V.I.S.: ${commandResponse}`);
         await speak(commandResponse);
       } else if (classification.status === "NONE") {
+        if (commandSessionId === sessionId) lastCommand = null;
+
         await processMessage(cleanedTranscription, conversationHistory, () => {
+          if (commandSessionId !== sessionId) return false;
+
           state = "SPEAKING";
           console.log("JARVIS is speaking...");
+          return true;
         });
       } else {
         console.error("JARVIS could not classify the request.");
@@ -291,9 +320,9 @@ export const startVoiceController = async (): Promise<void> => {
       }
     } finally {
       try {
-        await unlink("command.wav");
+        await unlink(commandFile);
       } catch (error) {
-        console.error("Unable to delete command.wav:", error);
+        console.error(`Unable to delete ${commandFile}:`, error);
       }
       if (!isShuttingDown && commandSessionId === sessionId) {
         resetListeningSession();
@@ -302,7 +331,7 @@ export const startVoiceController = async (): Promise<void> => {
     }
   };
 
-  process.on("SIGINT", () => {
+  process.on("SIGINT", async () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
 
@@ -310,7 +339,14 @@ export const startVoiceController = async (): Promise<void> => {
 
     console.log("Shutting down voice controller...");
 
+    stopKokoroPlayback();
     child.kill("SIGTERM");
+
+    try {
+      await shutdownKokoroWorker();
+    } catch (error) {
+      console.error("Failed to shut down Kokoro worker:", error);
+    }
   });
 
   const wakeInterval = setInterval(() => {

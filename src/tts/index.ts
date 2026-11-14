@@ -1,4 +1,4 @@
 import { speak } from "./speech.js";
-import { stopKokoroPlayback } from "./kokoro.js";
+import { stopKokoroPlayback, shutdownKokoroWorker } from "./kokoro.js";
 
-export { speak, stopKokoroPlayback };
+export { speak, stopKokoroPlayback, shutdownKokoroWorker };

@@ -36,6 +36,13 @@ export const speak = async (text: string): Promise<void> => {
       error instanceof Error && "signal" in error && error.signal === "SIGINT";
     if (interrupted) return;
 
+    if (
+      error instanceof Error &&
+      (error.message === "Kokoro worker is shutting down" ||
+        error.message === "Kokoro worker is unavailable")
+    )
+      return;
+
     console.error("Failed to run Kokoro:", error);
     await execFileAsync("say", [text]);
   }

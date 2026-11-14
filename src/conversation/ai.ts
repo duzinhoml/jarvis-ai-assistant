@@ -9,20 +9,25 @@ type Message = {
 export const processMessage = async (
   userInput: string,
   conversationHistory: Message[],
-  onSpeaking?: () => void,
+  onSpeaking?: () => boolean,
 ): Promise<void> => {
-  conversationHistory.push({ role: "user", content: userInput });
-
   const response = await ollama.chat({
     model: "qwen3:1.7b",
-    messages: conversationHistory,
+    messages: [...conversationHistory, { role: "user", content: userInput }],
+  });
+
+  if (onSpeaking?.() === false) return;
+
+  conversationHistory.push({
+    role: "user",
+    content: userInput,
   });
 
   conversationHistory.push({
     role: "assistant",
     content: response.message.content,
   });
+
   console.log(`J.A.R.V.I.S.: ${response.message.content}`);
-  onSpeaking?.();
   await speak(response.message.content);
 };
