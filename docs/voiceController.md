@@ -1,6 +1,6 @@
 # JARVIS Voice Controller
 
-**Source:** `src/voiceController.ts`
+**Source:** `src/voice/controller.ts`
 
 ## Overview
 
@@ -15,6 +15,7 @@ Its main responsibilities are:
 - Preserve audio while asynchronous transcription is running.
 - Record commands and determine when the user finishes speaking.
 - Manage listening states, timeouts, and session resets.
+- Coordinate native playback requests, completion events, and shutdown cleanup.
 
 ---
 
@@ -23,12 +24,63 @@ Its main responsibilities are:
 ### Microphone Process
 
 ```ts
-const child = startMicrophone();
+const VAD = await VADBuilder();
+const vad = new VAD(VADMode.VERY_AGGRESSIVE, 16000);
+const frameBuffer = new AudioFrameBuffer();
+
+const microphoneSource =
+  process.env.JARVIS_AUDIO_SOURCE === "sox" ? "sox" : "native";
+const child = startMicrophone(microphoneSource);
 ```
+
+VAD initializes before microphone startup so process handlers can be attached without an intervening asynchronous wait. Native capture is the default; `JARVIS_AUDIO_SOURCE=sox` selects the fallback. Both provide **16 kHz mono signed Int16 little-endian PCM** on stdout.
 
 Starts the microphone as a **child process**, which continuously sends raw audio to Node.js through its standard output (`stdout`).
 
 The microphone runs independently from the voice controller's asynchronous operations.
+
+In native mode, `src/audio/microphone.ts` starts `swift native/audio/main.swift`. Swift captures 44.1 kHz Float32 audio through VoiceProcessingIO, moves samples through a preallocated ring buffer, and converts them outside the real-time callback. TypeScript continues to own VAD, wake-word detection, commands, and conversation state.
+
+Wait for **“Voice processing enabled…”** before speaking. The initial “Initializing J.A.R.V.I.S...” message does not mean capture is ready. Run from the project root so relative source, model, and worker paths resolve correctly.
+
+### Native Playback Configuration
+
+```ts
+configureNativePlayback(
+  microphoneSource === "native"
+    ? { play: playNativeAudio, stop: stopNativeAudio }
+    : null,
+);
+```
+
+Kokoro receives playback functions from the controller instead of managing the Swift child process directly. In native mode, Swift converts each generated WAV to 44.1 kHz mono Float32 and plays it through the same VoiceProcessingIO unit that captures the microphone. This provides a playback reference for echo processing. File loading and conversion remain outside the speaker callback.
+
+Selecting SoX also selects the existing `afplay` playback path. It is a manual fallback, not an automatic restart or failover after native-process failure:
+
+```sh
+JARVIS_AUDIO_SOURCE=sox npx tsx src/main.ts
+```
+
+### Native Process Communication
+
+| Stream | Contents |
+| ------ | -------- |
+| stdin | Newline-delimited JSON playback commands from TypeScript |
+| stdout | Raw microphone PCM only |
+| stderr | Diagnostic text and newline-delimited JSON playback events |
+
+Commands use IDs to associate each response with its waiting playback request:
+
+```json
+{"type":"play","id":1,"path":"/absolute/path/to/speech.wav"}
+{"type":"stop","id":1}
+```
+
+Swift responds with `playbackFinished`, `playbackStopped`, or `playbackError`. Each event contains the request ID; errors also include a `message`.
+
+The controller uses `createInterface()` from `node:readline` because a pipe chunk may contain part of a line or several lines. Each line is parsed as JSON and checked with `isNativePlaybackEvent()`; ordinary diagnostics are displayed unchanged.
+
+`playNativeAudio()` registers a Promise in `pendingNativePlayback` **before** sending PLAY. A finished or stopped event resolves that Promise; an error event rejects it. Both paths remove the request and clear its timers. Writing a command to stdin only confirms transmission, not playback completion. Kokoro waits for the playback Promise before deleting the temporary WAV or advancing to the next chunk.
 
 ### Conversation History
 
@@ -160,6 +212,7 @@ let listeningStart: number | null = null;
 **Important:** `listeningStart` is initially set when JARVIS enters `LISTENING`. However, if the wake-word snapshot did not already contain the user's command (`!vadVoiceDetected`), `listeningStart` is re-assigned to `Date.now()` the moment command speech is first detected by VAD.
 
 Consequently:
+
 - The **first-command timeout** (4 seconds) measures elapsed time from entering `LISTENING` while waiting for the user to begin speaking.
 - The **maximum listening timeout** (10 seconds) measures elapsed time from when command speech begins (or from `LISTENING` entry if the wake snapshot already contained command audio), ensuring the user has the full 10-second duration to speak their request.
 
@@ -192,9 +245,18 @@ let sessionId = 0;
 
 `sessionId` identifies the current listening session.
 
-When a session resets or when playback is interrupted via barge-in (`state === "SPEAKING"`), `sessionId` increments:
+When a session resets, playback is interrupted via barge-in (`state === "SPEAKING"`), or the controller shuts down, `sessionId` increments:
+
 - An asynchronous wake-word transcription compares its captured `checkSessionId` against `sessionId` to avoid applying outdated detections.
 - An in-flight command execution checks `commandSessionId === sessionId` before running error-handling speech or session cleanup, ensuring a superseded session never overwrites an active interruption.
+
+### Native Playback Timeout
+
+Native playback has a separate **120,000 ms** timeout. When it expires, the request stays registered while the controller sends STOP for that ID. Swift's completion/stop response then settles the request as a timeout error, allowing the speech wrapper's existing failure handling to run.
+
+If STOP is not acknowledged within **2,000 ms**, or sending that timeout STOP fails, the controller sends `SIGKILL` to the helper. Process-close cleanup rejects pending requests and shuts down the controller. Restart JARVIS after that failure; native capture is not automatically recreated.
+
+`playNativeAudio()` rejects requests when shutting down or when the child/command pipe is unavailable. `stopNativeAudio()` skips writes to an unavailable process, avoiding a redundant STOP after the helper has already exited.
 
 ### Session Reset (`resetListeningSession`)
 
@@ -236,6 +298,8 @@ const frameBuffer = new AudioFrameBuffer();
 - `16000`: Configures VAD for 16 kHz audio.
 - `AudioFrameBuffer`: Organizes microphone chunks into fixed-sized frames.
 
+The current `src/audio/frameBuffer.ts` produces **30 ms frames**: 480 samples, or 960 bytes, at 16 kHz Int16 mono. VAD initialization happens before microphone startup; the code above describes that same initialization, not a second instance.
+
 ### VAD Tracking Variables
 
 ```ts
@@ -250,13 +314,13 @@ let idleSpeechDetected = false;
 | `vadSilentFrames`    | Counts consecutive silent frames                  |
 | `vadVoiceDetected`   | Indicates command speech was detected or inferred |
 | `VAD_SILENCE_FRAMES` | Sets the silence threshold to 50 frames           |
-| `idleSpeechDetected` | Indicates speech occurred while IDLE              |
+| `idleSpeechDetected` | Indicates speech occurred while IDLE or SPEAKING   |
 
 When VAD detects voice during `LISTENING`, the silence counter resets to zero.
 
 When VAD detects silence, the counter increases.
 
-**Remember:** 50 frames does not necessarily mean 50 milliseconds. The duration depends on the number of samples in each frame.
+With the current 30 ms frames, 50 consecutive silent frames represent approximately **1.5 seconds** of audio, not 50 milliseconds.
 
 ---
 
@@ -479,13 +543,13 @@ This prevents subsequent microphone events from repeatedly starting the same com
 
 ### Overview
 
-Speech barge-in allows the user to say the wake word ("Jarvis") while JARVIS is actively speaking (`SPEAKING` state). This immediately interrupts the speech playback and transitions directly into recording a new command (`LISTENING` state).
+Speech barge-in allows the user to say the wake word ("Jarvis") while JARVIS is actively speaking (`SPEAKING` state). Once the wake word is confirmed, the controller requests playback interruption and transitions directly into recording a new command (`LISTENING` state). Detection is not instantaneous: wake-word checks run approximately every second and require Whisper transcription.
 
 ### Interruption Trigger
 
 ```ts
 if (
-  containsWakeWord(transcription) &&
+  containsWakeWord(transcription, state === "SPEAKING") &&
   canDetectWakeWord() &&
   !isShuttingDown &&
   checkSessionId === sessionId
@@ -511,7 +575,7 @@ if (
 When the wake word is confirmed while `state === "SPEAKING"`:
 
 1. **`sessionId++`**: Invalidates the prior session so that in-flight asynchronous operations or error handlers from that command cycle are disregarded.
-2. **`stopKokoroPlayback()`**: Sends `SIGTERM` to the active `afplay` child process in Kokoro TTS, cutting off speech playback immediately.
+2. **`stopKokoroPlayback()`**: Increments Kokoro's separate `speechSession` counter so older speech cannot advance to another chunk. In native mode it sends STOP for pending playback IDs; in SoX mode it interrupts the active `afplay` process with `SIGTERM`.
 3. **Buffer reset**: Discards prior command audio and seeds the new command buffer with the captured wake-word audio and any pending chunks.
 4. **Immediate listening**: Switches `state = "LISTENING"` and records the user's new request without requiring an idle transition or cooldown.
 
@@ -540,6 +604,11 @@ When barge-in interrupts a command:
 
 - The interrupted command's `processCommand` execution might be waiting on playback completion or error unwinding.
 - Checking `commandSessionId === sessionId` in `catch` and `finally` ensures an interrupted command cannot attempt to speak an error or reset the state machine to `IDLE` while the new command is actively being recorded in `LISTENING`.
+- Kokoro also checks its own `speechSession` when native playback rejects. If that speech session was superseded or stopped, the old response ends quietly instead of triggering fallback speech.
+
+Native STOP acknowledgement resolves the pending playback Promise as an expected interruption. The speaker callback outputs silence after observing the stop request; it does not parse JSON or log events. A worker reports the acknowledgement outside the callback.
+
+The `say` fallback used by `src/tts/speech.ts` is a separate playback path. It does not provide the same native echo reference or interruption behavior.
 
 ---
 
@@ -559,7 +628,7 @@ The wake buffer helps recognize "Jarvis"; the pending buffer preserves audio dur
 
 **Speech barge-in**
 
-Microphone audio and VAD monitoring remain active while JARVIS speaks (`canDetectWakeWord()`). If the wake word is spoken during playback, JARVIS halts speech output immediately via `stopKokoroPlayback()`, increments `sessionId` to obsolete the prior command flow, and begins recording the new command right away.
+Microphone audio and VAD monitoring remain active while JARVIS speaks (`canDetectWakeWord()`). When Whisper confirms the wake word during playback, JARVIS requests a stop via `stopKokoroPlayback()`, increments `sessionId` to obsolete the prior command flow, and begins collecting the new command without waiting for another idle cycle.
 
 **Asynchronous execution**
 
@@ -572,3 +641,33 @@ Microphone audio and VAD monitoring remain active while JARVIS speaks (`canDetec
 **Timeouts**
 
 The first-command timeout starts when JARVIS enters `LISTENING` and resets the session to `IDLE` after 4 seconds if no speech is detected. Once command speech begins, `listeningStart` is updated to measure the 10-second maximum listening duration from speech onset.
+
+Playback has its own two-minute timeout and two-second STOP acknowledgement limit; these do not change command-listening timeouts.
+
+---
+
+## 10. Shutdown and Process Failure
+
+`shutdownVoiceController()` is shared by SIGINT, SIGTERM, child-process errors, and unexpected child closure. Its shutdown flag prevents duplicate cleanup.
+
+It marks shutdown active, increments the controller session, clears wake-word polling, and stops the Kokoro speech session before rejecting pending native playback. That order prevents late playback errors from reviving an obsolete response. It clears native playback configuration, requests child termination if needed, destroys VAD, and requests Kokoro worker shutdown.
+
+Unexpected microphone exits are reported as failures and set `process.exitCode = 1`. A native helper that handles an externally sent SIGTERM may exit with `code 0, signal null`; its exit is still unexpected if the controller did not initiate shutdown. The helper is not restarted automatically.
+
+An stdin error rejects pending playback requests and logs the command-pipe failure. The child's error/close handlers handle controller shutdown. During normal shutdown, the helper intentionally discards pending microphone output rather than waiting indefinitely for a stalled reader.
+
+## 11. Milestone 9 Validation Checkpoint
+
+The native integration has been exercised through streamed audio playback and Whisper transcription, normal commands, repeated interruptions, silent-listening trials without reported self-activation, the manual SoX/`afplay` fallback, shutdown during speech, and unexpected helper-exit cleanup. A temporarily shortened playback timeout exercised acknowledged STOP recovery; the normal timeout was restored to **120,000 ms**.
+
+Offline native tests cover microphone ring-buffer wraparound and overflow, streaming format conversion, speech-file conversion, command framing, rendering, completion, stop handling, and stale stop IDs. Run them from the project root:
+
+```sh
+swift native/audio/main.swift --test-streaming-buffer
+swift native/audio/main.swift --test-converter
+swift native/audio/main.swift --test-playback
+```
+
+These self-tests do not start microphone capture or speaker playback. TypeScript is checked separately with `npx tsc --noEmit`.
+
+Missing STOP acknowledgement and forced termination were checked with simulated timers, not a live hung-helper trial. Echo suppression for production Kokoro playback has not been quantitatively measured. These results establish the tested integration behavior rather than a guarantee across all devices, volumes, or listening environments.

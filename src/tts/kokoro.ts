@@ -2,6 +2,20 @@ import { execFile, type ChildProcess } from "node:child_process";
 import { unlink } from "node:fs/promises";
 import { chunkText } from "./chunkText.js";
 import { Worker } from "node:worker_threads";
+import { resolve } from "node:path";
+
+type NativePlayback = {
+  play: (path: string) => Promise<void>;
+  stop: () => Promise<void>;
+};
+
+let nativePlayback: NativePlayback | null = null;
+
+export const configureNativePlayback = (
+  playback: NativePlayback | null,
+): void => {
+  nativePlayback = playback;
+};
 
 let activePlayback: ChildProcess | null = null;
 let interruptPlayback: (() => void) | null = null;
@@ -110,6 +124,18 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
     }
 
     try {
+      const playback = nativePlayback;
+      if (playback) {
+        try {
+          await playback.play(resolve(output));
+        } catch (error) {
+          if (currentSession !== speechSession) return;
+          throw error;
+        }
+
+        continue;
+      }
+
       await new Promise<void>((resolve, reject) => {
         let wasInterrupted = false;
 
@@ -158,6 +184,13 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
 export const stopKokoroPlayback = (): void => {
   speechSession++;
   interruptPlayback?.();
+
+  const playback = nativePlayback;
+  if (playback) {
+    playback.stop().catch((error: unknown) => {
+      console.error("Failed to stop native playback:", error);
+    });
+  }
 };
 
 export const shutdownKokoroWorker = async (): Promise<void> => {
@@ -173,12 +206,14 @@ export const shutdownKokoroWorker = async (): Promise<void> => {
 
   await new Promise<void>((resolve, reject) => {
     const shutdownTimeout = setTimeout(() => {
-      console.warn("Kokoro worker shutdown timed out.");
+      console.warn("Kokoro worker shutdown timed out; forcing termination.");
 
       kokoroWorker.removeListener("error", onShutdownError);
       kokoroWorker.removeListener("exit", onShutdownExit);
 
-      reject(new Error("Kokoro worker failed to shut down within 10 seconds"));
+      kokoroWorker.terminate().then(() => {
+        resolve();
+      }, reject);
     }, 10000);
 
     const onShutdownError = (error: Error): void => {

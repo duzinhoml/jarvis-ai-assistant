@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { loadEnvFile } from "node:process";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile } from "node:child_process";
 
 loadEnvFile(".env");
 

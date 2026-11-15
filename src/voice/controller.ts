@@ -1,5 +1,7 @@
 import {
   startMicrophone,
+  isNativePlaybackEvent,
+  sendNativePlaybackCommand,
   type ListeningState,
   createAudioBuffers,
   resetAudioBuffers,
@@ -14,6 +16,7 @@ import {
   speak,
   stopKokoroPlayback,
   shutdownKokoroWorker,
+  configureNativePlayback,
 } from "../tts/index.js";
 import {
   executeLocalCommand,
@@ -21,9 +24,164 @@ import {
   type LocalCommand,
 } from "../commands/index.js";
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
+import { createInterface } from "node:readline";
 
 export const startVoiceController = async (): Promise<void> => {
-  const child = startMicrophone();
+  const VAD = await VADBuilder();
+  const vad = new VAD(VADMode.VERY_AGGRESSIVE, 16000);
+  const frameBuffer = new AudioFrameBuffer();
+
+  const microphoneSource =
+    process.env.JARVIS_AUDIO_SOURCE === "sox" ? "sox" : "native";
+  const child = startMicrophone(microphoneSource);
+
+  const pendingNativePlayback = new Map<
+    number,
+    { resolve: () => void; reject: (error: Error) => void }
+  >();
+
+  let nextNativePlaybackId = 0;
+
+  const playNativeAudio = (path: string): Promise<void> => {
+    if (
+      isShuttingDown ||
+      child.killed ||
+      child.exitCode !== null ||
+      child.signalCode !== null ||
+      child.stdin.destroyed ||
+      !child.stdin.writable
+    ) {
+      return Promise.reject(new Error("Native audio playback is unavailable"));
+    }
+
+    const id = ++nextNativePlaybackId;
+
+    return new Promise((resolve, reject) => {
+      let timedOut = false;
+      let stopTimeout: ReturnType<typeof setTimeout> | undefined;
+
+      const timeout = setTimeout(() => {
+        timedOut = true;
+
+        stopTimeout = setTimeout(() => {
+          console.error("Native playback did not acknowledge STOP.");
+          child.kill("SIGKILL");
+        }, 2_000);
+
+        sendNativePlaybackCommand(child, {
+          type: "stop",
+          id,
+        }).catch((error: unknown) => {
+          console.error("Native timeout cancellation failed:", error);
+          child.kill("SIGKILL");
+        });
+      }, 120_000);
+
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        clearTimeout(stopTimeout);
+        pendingNativePlayback.delete(id);
+      };
+
+      const finish = (): void => {
+        cleanup();
+
+        if (timedOut) {
+          reject(new Error(`Native playback ${id} timed out`));
+        } else {
+          resolve();
+        }
+      };
+
+      const fail = (error: Error): void => {
+        cleanup();
+        reject(error);
+      };
+
+      pendingNativePlayback.set(id, {
+        resolve: finish,
+        reject: fail,
+      });
+
+      sendNativePlaybackCommand(child, {
+        type: "play",
+        id,
+        path,
+      }).catch((error: unknown) => {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  };
+
+  const stopNativeAudio = async (): Promise<void> => {
+    if (
+      child.killed ||
+      child.exitCode !== null ||
+      child.signalCode !== null ||
+      child.stdin.destroyed ||
+      !child.stdin.writable
+    ) {
+      return;
+    }
+
+    const ids = [...pendingNativePlayback.keys()];
+
+    await Promise.all(
+      ids.map((id) => sendNativePlaybackCommand(child, { type: "stop", id })),
+    );
+  };
+
+  const rejectPendingNativePlayback = (error: Error): void => {
+    for (const pending of pendingNativePlayback.values()) {
+      pending.reject(error);
+    }
+
+    pendingNativePlayback.clear();
+  };
+
+  child.stdin.on("error", (error: Error) => {
+    rejectPendingNativePlayback(error);
+    console.error("Native audio command pipe failed:", error);
+  });
+
+  const nativeMessages = createInterface({
+    input: child.stderr,
+    crlfDelay: Infinity,
+  });
+
+  nativeMessages.on("line", (line: string) => {
+    let message: unknown;
+
+    try {
+      message = JSON.parse(line);
+    } catch {
+      console.error(line);
+      return;
+    }
+
+    if (isNativePlaybackEvent(message)) {
+      const pending = pendingNativePlayback.get(message.id);
+      if (!pending) return;
+
+      pendingNativePlayback.delete(message.id);
+
+      if (message.type === "playbackError") {
+        pending.reject(new Error(message.message));
+      } else {
+        pending.resolve();
+      }
+
+      return;
+    }
+
+    console.error(line);
+  });
+
+  configureNativePlayback(
+    microphoneSource === "native"
+      ? { play: playNativeAudio, stop: stopNativeAudio }
+      : null,
+  );
 
   type Message = {
     role: "user" | "assistant" | "system";
@@ -60,9 +218,6 @@ export const startVoiceController = async (): Promise<void> => {
 
   let sessionId = 0;
 
-  const VAD = await VADBuilder();
-  const vad = new VAD(VADMode.VERY_AGGRESSIVE, 16000);
-  const frameBuffer = new AudioFrameBuffer();
   let vadSilentFrames = 0;
   let vadVoiceDetected = false;
   const VAD_SILENCE_FRAMES = 50;
@@ -331,23 +486,38 @@ export const startVoiceController = async (): Promise<void> => {
     }
   };
 
-  process.on("SIGINT", async () => {
+  const shutdownVoiceController = (error?: Error): void => {
     if (isShuttingDown) return;
     isShuttingDown = true;
+    sessionId++;
 
     clearInterval(wakeInterval);
-
-    console.log("Shutting down voice controller...");
-
     stopKokoroPlayback();
-    child.kill("SIGTERM");
+    rejectPendingNativePlayback(
+      error ?? new Error("Voice controller is shutting down"),
+    );
+    configureNativePlayback(null);
 
-    try {
-      await shutdownKokoroWorker();
-    } catch (error) {
-      console.error("Failed to shut down Kokoro worker:", error);
+    if (!child.killed && child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
     }
-  });
+
+    vad.destroy();
+
+    shutdownKokoroWorker().catch((shutdownError: unknown) => {
+      console.error("Failed to shut down Kokoro worker:", shutdownError);
+    });
+
+    if (error) {
+      console.error("Voice controller stopped:", error);
+      process.exitCode = 1;
+    } else {
+      console.log("Shutting down voice controller...");
+    }
+  };
+
+  process.on("SIGINT", () => shutdownVoiceController());
+  process.on("SIGTERM", () => shutdownVoiceController());
 
   const wakeInterval = setInterval(() => {
     if (isShuttingDown) return;
@@ -358,15 +528,16 @@ export const startVoiceController = async (): Promise<void> => {
   }, 1000);
 
   child.on("error", (error) => {
-    isShuttingDown = true;
-    clearInterval(wakeInterval);
-    console.error("Microphone process failed:", error);
+    shutdownVoiceController(error);
   });
 
-  child.on("close", () => {
-    isShuttingDown = true;
-    clearInterval(wakeInterval);
-    vad.destroy();
+  child.on("close", (code, signal) => {
     console.log("Microphone process finished.");
+
+    if (!isShuttingDown) {
+      shutdownVoiceController(
+        new Error(`Microphone exited: code ${code}, signal ${signal}`),
+      );
+    }
   });
 };

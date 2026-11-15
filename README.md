@@ -19,9 +19,9 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Local AI Conversations:** Generate responses using locally hosted language models through Ollama.
 - **Voice Activation:** Begin requests with “Jarvis,” “Hey Jarvis,” or “Hi Jarvis,” detected through local Whisper transcription.
 - **Terminal Feedback:** Display listening states, transcriptions, responses, and errors in the terminal.
-- **Text-to-Speech:** Generate spoken responses locally using Kokoro in a worker thread, with chunked playback through macOS `afplay` and `say` fallback for supported error paths.
+- **Text-to-Speech:** Generate spoken responses locally using Kokoro in a worker thread, with chunked playback through native VoiceProcessingIO. SoX mode uses macOS `afplay`; supported speech failures fall back to `say`.
 - **Speech Interruption:** Detect the wake word during Kokoro speech to interrupt playback and begin a new request.
-- **Speech Recording:** Capture microphone input using SoX.
+- **Speech Recording:** Capture microphone input through native VoiceProcessingIO and stream 16 kHz mono Int16 PCM to TypeScript, with SoX available as a manual fallback.
 - **Speech Recognition:** Transcribe recorded audio using Whisper.
 - **Voice Activity Detection (VAD):** Detect speech and silence with WebRTC VAD and use listening timeouts to process requests.
 - **Intent Classification:** Route natural-language requests to approved commands, with limited context from the previous command.
@@ -37,6 +37,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Voice Session Recovery:** Improve microphone failure cleanup, worker shutdown, and speech fallback behavior.
 - **Command Reliability:** Refine intent classification and contextual follow-up handling.
 - **Speech Latency:** Improve response times and interruption handling.
+- **Echo Processing:** Quantitatively measure echo suppression across playback volumes and listening environments.
 
 ### Planned
 
@@ -57,9 +58,10 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 | Ollama       | Local LLM execution                 |
 | Qwen         | Local conversational language model |
 | Whisper.cpp  | Speech-to-text transcription        |
-| SoX          | Audio recording and processing      |
+| Swift / VoiceProcessingIO | Native microphone capture, speech playback, and voice processing |
+| SoX          | Fallback microphone capture and resampling |
 | Kokoro / ONNX | Local speech synthesis in a worker thread |
-| macOS `afplay` / `say` | Audio playback and fallback speech |
+| macOS `afplay` / `say` | Fallback audio playback and speech |
 | macOS utilities / AppleScript | Application, battery, and Music controls |
 | WebRTC VAD   | Voice activity detection            |
 | Git & GitHub | Version control                     |
@@ -70,6 +72,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 
 - macOS
 - Node.js and npm
+- Swift toolchain with the `Synchronization` module (used by the native audio backend)
 - Ollama
 - SoX
 - Whisper.cpp
@@ -109,7 +112,7 @@ Using Homebrew:
 brew install sox whisper-cpp
 ```
 
-Download the Whisper English base model and place it at `models/ggml-base.en.bin`. Ensure `rec` and `whisper-cli` are available on your `PATH`.
+Download the Whisper English base model and place it at `models/ggml-base.en.bin`. Ensure `swift`, `sox`, and `whisper-cli` are available on your `PATH`.
 
 **5. Configure the application**
 
@@ -128,13 +131,29 @@ npx tsc
 npx tsx src/main.ts
 ```
 
+Native audio is selected by default. Wait for **“Voice processing enabled…”** before speaking; “Initializing J.A.R.V.I.S...” only indicates that startup has begun.
+
+To use SoX capture with `afplay` playback instead:
+
+```bash
+JARVIS_AUDIO_SOURCE=sox npx tsx src/main.ts
+```
+
+This selects the fallback for that invocation; it is not an automatic failover. Keep running from the project root so the native source, models, and worker paths resolve correctly.
+
 Compile before the first run and after changes to the Kokoro worker: the application loads the worker from `dist/tts/kokoroWorker.js`.
 
 Say “Jarvis” followed by a request, such as “Jarvis, open Safari” or “Jarvis, what time is it?” Say “Jarvis, stop” to interrupt Kokoro speech. Press **Ctrl+C** to request shutdown.
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
-To check types without compiling, run `npx tsc --noEmit`. The `npm test` script is currently a placeholder; automated tests are not configured.
+To check types without compiling, run `npx tsc --noEmit`. The `npm test` script is currently a placeholder. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
+
+```bash
+swift native/audio/main.swift --test-streaming-buffer
+swift native/audio/main.swift --test-converter
+swift native/audio/main.swift --test-playback
+```
 
 ## Architecture
 
@@ -146,11 +165,13 @@ Processes natural-language input, manages session history, and generates respons
 
 ### Speech Recognition
 
-Captures microphone input using SoX, detects voice activity with WebRTC VAD, and transcribes wake-word snapshots and command recordings using Whisper.cpp.
+The Swift helper in `native/audio/main.swift` captures 44.1 kHz mono Float32 microphone audio through VoiceProcessingIO. A preallocated ring buffer moves samples out of the real-time callback; a persistent converter produces 16 kHz mono signed Int16 little-endian PCM on stdout. Diagnostics and playback events use stderr. TypeScript retains WebRTC VAD, Whisper transcription, wake-word recognition, and session management. SoX provides the same PCM format when the fallback is selected.
 
 ### Speech Synthesis
 
-Splits responses into chunks of up to 200 characters and generates audio sequentially through a Kokoro worker thread. Plays temporary WAV files using macOS `afplay` and removes them after use. The speech wrapper uses `say` for supported failure paths.
+Splits responses into chunks of up to 200 characters and generates audio sequentially through a Kokoro worker thread. TypeScript sends WAV paths and request IDs as newline-delimited JSON commands to the native helper's stdin. Swift loads and converts speech outside the real-time callback, then plays it through the same VoiceProcessingIO unit used for capture, providing a playback reference for echo processing. Completion and stop events settle waiting playback requests before temporary WAV files are removed.
+
+SoX mode retains `afplay` playback. The speech wrapper uses `say` for supported failure paths; this fallback uses a separate playback path and does not have the same native interruption behavior. Native playback requests have a two-minute timeout, followed by a STOP request and a two-second acknowledgement limit. An unresponsive helper is terminated and the controller shuts down; restarting JARVIS is required.
 
 ### Intent Classification
 
@@ -174,6 +195,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Retrieve time, date, and battery information.
 - [x] Add study music and Apple Music playback commands.
 - [x] Add worker-based Kokoro synthesis, text chunking, and speech interruption.
+- [x] Integrate native VoiceProcessingIO capture and Kokoro playback, with PCM streaming and a manual SoX fallback.
 - [ ] Improve wake-word reliability, failure recovery, and shutdown handling.
 - [ ] Improve conversational voice interaction.
 - [ ] Implement persistent memory.
@@ -210,6 +232,8 @@ JARVIS is designed primarily for local execution.
 ## Project Status
 
 **Active Development**
+
+Milestone 9 native audio validation includes intelligible streamed audio, Whisper transcription, repeated wake-word interruption, silent-listening trials without reported self-activation, fallback operation, shutdown during speech, unexpected helper-exit cleanup, and acknowledged playback-timeout recovery. Missing STOP acknowledgement and forced termination were checked with simulated timers; echo suppression has not yet been quantitatively measured for production Kokoro playback.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 

@@ -1,11 +1,18 @@
 import { startVoiceController } from "./voice/controller.js";
+import { shutdownKokoroWorker } from "./tts/kokoro.js";
 
 const main = async (): Promise<void> => {
   console.log("Initializing J.A.R.V.I.S...");
   await startVoiceController();
 };
 
-main().catch((error) => {
+main().catch(async (error: unknown) => {
   console.error("JARVIS failed:", error);
   process.exitCode = 1;
+
+  try {
+    await shutdownKokoroWorker();
+  } catch (shutdownError: unknown) {
+    console.error("Startup cleanup failed:", shutdownError);
+  }
 });
