@@ -78,6 +78,8 @@ export const classifyIntent = async (
     - RESUME_MUSIC: User requests playback to be resumed or continued in the
       macOS Music application (Apple Music). Does NOT control YouTube,
       browsers, Spotify, or other media applications.
+    - CLEAR_HISTORY: User explicitly requests clearing JARVIS's conversation
+      or chat history, including saved conversation history.
 
     CLASSIFICATION RULES:
     1. Return exactly ONE approved command identifier or NONE.
@@ -375,6 +377,44 @@ export const classifyIntent = async (
 
     User: "Please resume Apple Music now."
     Output: RESUME_MUSIC
+
+    CONVERSATION HISTORY RULES:
+    - Return CLEAR_HISTORY only for an explicit, affirmative request
+      to clear, delete, or erase JARVIS's conversation or chat history.
+    - The current message must identify conversation or chat history
+      as the target. Do not infer this target from previous commands.
+    - Return NONE for negated, hypothetical, quoted, or informational
+      requests about clearing history.
+    - Return NONE for vague phrases such as "forget it", "start over",
+      or "reset everything".
+    - Browser history, files, and individual remembered facts are not
+      targets of CLEAR_HISTORY.
+
+    HISTORY EXAMPLES:
+
+    User: "Clear my conversation history."
+    Output: CLEAR_HISTORY
+
+    User: "Please delete your saved chat history."
+    Output: CLEAR_HISTORY
+
+    User: "Don't clear my conversation history."
+    Output: NONE
+
+    User: "How do I clear conversation history?"
+    Output: NONE
+
+    User: "What happens if I delete my conversation history?"
+    Output: NONE
+
+    User: "Forget it."
+    Output: NONE
+
+    User: "Clear my browser history."
+    Output: NONE
+
+    User: "Forget my favourite colour."
+    Output: NONE
 
     OUTPUT REQUIREMENTS:
     - Output ONLY the command identifier or NONE.

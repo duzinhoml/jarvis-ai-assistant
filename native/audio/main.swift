@@ -1044,22 +1044,6 @@ func runAudio(recordingTest: Bool) throws {
         diagnostic("Converted audio frames: \(converted.frameLength)")
         diagnostic("Recording and converted PCM saved under native/audio/samples/")
     }
-    let recorded = context.recordedFrameCount.load(ordering: .relaxed)
-    diagnostic("Recorded microphone frames: \(recorded)")
-    diagnostic("Recorded audio duration: \(Double(recorded) / 44100) seconds (fixed recording buffer)")
-    let total = context.totalSampleCount.load(ordering: .relaxed)
-    let read = context.streamingReadPosition.load(ordering: .relaxed)
-    let write = context.streamingWritePosition.load(ordering: .acquiring)
-    diagnostic("Captured frames: \(total)")
-    diagnostic("Streaming buffered frames: \((write - read + context.streamingCapacity) % context.streamingCapacity)")
-    diagnostic("Streaming dropped frames: \(context.streamingDroppedFrames.load(ordering: .relaxed))")
-    diagnostic("Speech detection callbacks: \(context.speechDetectedCount.load(ordering: .relaxed))")
-    diagnostic("Peak microphone amplitude: \(Float(bitPattern: context.peakAmplitudeBits.load(ordering: .relaxed)))")
-    if total > 0 {
-        let energy = Double(bitPattern: context.totalSumOfSquaresBits.load(ordering: .relaxed))
-        diagnostic("Overall recording RMS: \(sqrt(energy / Double(total)))")
-    }
-    diagnostic("Invalid speaker playback buffers: \(context.invalidPlaybackBufferCount.load(ordering: .relaxed))")
 }
 
 func testNativePlayback() throws {

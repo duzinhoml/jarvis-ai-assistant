@@ -16,6 +16,7 @@ Its main responsibilities are:
 - Record commands and determine when the user finishes speaking.
 - Manage listening states, timeouts, and session resets.
 - Coordinate native playback requests, completion events, and shutdown cleanup.
+- Restore bounded conversation context and coordinate persistent-history saves and clearing.
 
 ---
 
@@ -95,14 +96,62 @@ const conversationHistory: Message[] = [
 ];
 ```
 
-Stores messages used by JARVIS's conversational AI.
+Stores messages used by JARVIS's conversational AI. The startup code then appends the user and assistant messages from each turn selected by `selectRecentTurns(savedHistory.turns)`.
 
 Each message contains:
 
 - `role`: Who the message belongs to.
 - `content`: The message text.
 
-The history initially contains the system prompt. The controller passes it to `processMessage()` for conversational requests, but not to `executeLocalCommand()`.
+The history initially contains the current system prompt, followed by selected completed exchanges from earlier sessions. The controller passes it to `processMessage()` for conversational requests, but not to `executeLocalCommand()`.
+
+### Persistent History and Model Context
+
+`src/conversation/history.ts` defines a version-1 JSON document containing a `turns` array. Each turn contains string fields `userMessage`, `aiResponse`, and `completionTimestamp`; the timestamp must parse as a valid date. New turns use ISO timestamps. The system prompt is not persisted.
+
+The controller loads `data/conversation-history.json` before VAD initialization and microphone startup. The loader returns empty version-1 history only for a missing file (`ENOENT`). Other read errors, malformed JSON, unsupported versions, and invalid turns propagate. The controller reports those failures, retains empty session history, and disables persistence for that session rather than overwriting the rejected file.
+
+Two arrays serve different purposes:
+
+| Value | Purpose |
+| ----- | ------- |
+| `savedHistory.turns` | Full archive of completed exchanges loaded or collected this session |
+| `conversationHistory` | Current system prompt plus bounded recent messages supplied to Ollama |
+
+`MAX_CONTEXT_TURNS` is **10**, and `MAX_CONTEXT_CHARACTERS` is **6,000**. Startup selection copies the newest ten turns and removes complete oldest turns until their combined user/assistant text fits the size budget. After each completed response, `processMessage()` applies the equivalent limits to the running message array while preserving the system message at index 0. A single oversized pair is omitted from future model context but remains available for persistence.
+
+The size calculation uses JavaScript string `.length` (UTF-16 code units), not model tokens. The system prompt, message metadata, and current user request are outside the historical-text budget. The full archive is not truncated by model-context selection.
+
+### Recording Completed Exchanges
+
+`kokoroSpeech()` and `speak()` return a completion boolean. Expected interruption or unavailable speech returns `false`; unexpected failures still propagate, and successful `say` fallback returns `true`.
+
+`processMessage()` waits for speech and checks the controller's session-validity callback before appending the user/assistant pair. It returns a `ConversationTurn` for a completed, current-session exchange, or `null` for a rejected, interrupted, or obsolete response. The controller appends non-null turns to `savedHistory.turns` and awaits `queueHistorySave()`.
+
+Local-command responses and history-clear confirmations are not persisted as conversational turns. Conversation history does not automatically extract permanent facts or perform semantic retrieval over older exchanges.
+
+### Save Queue and Session-Only Mode
+
+`queueHistorySave()` copies the current turns array into a snapshot, then chains its save onto `historySaveQueue`. It checks `canPersistHistory` both when scheduling and when the queued operation starts. A save failure logs a warning, disables persistence, and is handled inside the callback so the queue does not remain rejected. Already queued operations then skip disk access.
+
+The storage helper creates the parent directory, writes JSON to a unique temporary file in that directory, and renames the completed file over the destination. If writing or renaming fails, it attempts to remove the temporary file and rethrows the original save error. This is atomic replacement, not a power-loss durability guarantee or a lock between independent JARVIS processes.
+
+Persistence defaults to enabled. Setting `JARVIS_HISTORY_ENABLED=false` skips loading and disables saving, including disk writes requested by the clear helper. The session still remembers completed exchanges in memory within the context limits. Start that mode from the project root:
+
+```sh
+JARVIS_HISTORY_ENABLED=false npx tsx src/main.ts
+```
+
+### Clearing History
+
+`CLEAR_HISTORY` is an allowlisted command handled by the controller, which owns the history arrays and save queue. The classifier prompt requires an explicit affirmative request targeting conversation/chat history; negated, hypothetical, vague, and unrelated requests are instructed to return `NONE`.
+
+The two helpers have different responsibilities:
+
+- `resetConversationHistory()` empties in-memory saved turns, removes model messages after the system prompt, and sets `lastCommand` to `null`. It does not immediately write a file; a later save would reflect that reset.
+- `clearConversationHistory()` waits for older queued saves, performs the memory reset, and awaits a save of empty history. It returns whether persistence remains available, allowing the spoken response to distinguish confirmed saved clearing from session-only clearing.
+
+The command branch preserves `lastCommand` as `null` after clearing. In disabled or failed-persistence mode, saved history remains untouched by this operation. Independently created backup files are not cleared.
 
 ### Listening States
 
@@ -652,6 +701,8 @@ Playback has its own two-minute timeout and two-second STOP acknowledgement limi
 
 It marks shutdown active, increments the controller session, clears wake-word polling, and stops the Kokoro speech session before rejecting pending native playback. That order prevents late playback errors from reviving an obsolete response. It clears native playback configuration, requests child termination if needed, destroys VAD, and requests Kokoro worker shutdown.
 
+Kokoro's graceful worker shutdown has a ten-second timeout; if it expires, shutdown requests forced worker termination and waits for completion. Startup failure in `src/main.ts` also requests worker shutdown, covering a failure before controller cleanup handlers have been registered.
+
 Unexpected microphone exits are reported as failures and set `process.exitCode = 1`. A native helper that handles an externally sent SIGTERM may exit with `code 0, signal null`; its exit is still unexpected if the controller did not initiate shutdown. The helper is not restarted automatically.
 
 An stdin error rejects pending playback requests and logs the command-pipe failure. The child's error/close handlers handle controller shutdown. During normal shutdown, the helper intentionally discards pending microphone output rather than waiting indefinitely for a stalled reader.
@@ -671,3 +722,11 @@ swift native/audio/main.swift --test-playback
 These self-tests do not start microphone capture or speaker playback. TypeScript is checked separately with `npx tsc --noEmit`.
 
 Missing STOP acknowledgement and forced termination were checked with simulated timers, not a live hung-helper trial. Echo suppression for production Kokoro playback has not been quantitatively measured. These results establish the tested integration behavior rather than a guarantee across all devices, volumes, or listening environments.
+
+## 12. Milestone 10 Validation Checkpoint
+
+Live tests verified history-file creation and recall after restart; omission of an interrupted answer followed by a local command; preservation of a rejected version-2 file; session-only recall without changing the saved file checksum; and clearing both session context and persisted turns. Tests that cleared or altered the real history file used a backup.
+
+Isolated checks verified serialized saves and snapshot contents, clearing after a pending save, disabling writes after load/save failures, original-file preservation and temporary-file cleanup on rename failure, malformed JSON and schema rejection, and startup/runtime turn and text-size limits. Interrupted and obsolete responses did not modify model context. These checks used temporary fixtures or substituted I/O, without changing the user's saved history.
+
+The final closeout checks also passed TypeScript checking, whitespace checks, native compilation, and all three native offline self-tests. The npm test script remains a placeholder; these isolated history checks are not yet a committed automated test suite.

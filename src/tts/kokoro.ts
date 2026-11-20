@@ -103,12 +103,12 @@ const generateWorkerAudio = async (text: string): Promise<string> => {
   });
 };
 
-export const kokoroSpeech = async (text: string): Promise<void> => {
+export const kokoroSpeech = async (text: string): Promise<boolean> => {
   const currentSession = ++speechSession;
 
   const chunks = chunkText(text);
   for (const chunk of chunks) {
-    if (currentSession !== speechSession) return;
+    if (currentSession !== speechSession) return false;
     console.log("Processing chunk:", chunk);
 
     const output = await generateWorkerAudio(chunk);
@@ -120,7 +120,7 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
         console.error("Failed to delete Kokoro audio:", error);
       }
 
-      return;
+      return false;
     }
 
     try {
@@ -129,7 +129,7 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
         try {
           await playback.play(resolve(output));
         } catch (error) {
-          if (currentSession !== speechSession) return;
+          if (currentSession !== speechSession) return false;
           throw error;
         }
 
@@ -179,6 +179,8 @@ export const kokoroSpeech = async (text: string): Promise<void> => {
       }
     }
   }
+
+  return currentSession === speechSession;
 };
 
 export const stopKokoroPlayback = (): void => {

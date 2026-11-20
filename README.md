@@ -27,7 +27,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Intent Classification:** Route natural-language requests to approved commands, with limited context from the previous command.
 - **macOS Integration:** Open Safari, Chrome, Visual Studio Code, and Finder. Retrieve the current time, date, and battery status.
 - **Music Commands:** Open a configured study playlist in Chrome and pause or resume Apple Music when explicitly named.
-- **Conversation History:** Maintain context across messages within a session.
+- **Conversation History:** Save completed conversational exchanges locally and restore recent context across restarts, with session-only mode and an explicit history-clearing command.
 - **Assistant Personality:** Custom system instructions define JARVIS's conversational behavior.
 - **Error Handling:** Handle model execution failures and other runtime errors.
 
@@ -41,7 +41,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 
 ### Planned
 
-- Persistent conversational memory.
+- Long-term memory for selected facts and preferences beyond recent conversation history.
 - Context-aware interactions and improved reasoning.
 - Expanded macOS automation.
 - Hardware integration using Arduino.
@@ -145,6 +145,22 @@ Compile before the first run and after changes to the Kokoro worker: the applica
 
 Say “Jarvis” followed by a request, such as “Jarvis, open Safari” or “Jarvis, what time is it?” Say “Jarvis, stop” to interrupt Kokoro speech. Press **Ctrl+C** to request shutdown.
 
+Conversation history persists by default in `data/conversation-history.json`, which is excluded from Git. Only completed conversational exchanges are saved; interrupted responses and local-command exchanges are not. Saved turns contain the user message, assistant response, and an ISO completion timestamp. The current system prompt is applied at startup rather than stored in that file.
+
+To start with empty conversational context and disable history-file reads and writes for one session:
+
+```bash
+JARVIS_HISTORY_ENABLED=false npx tsx src/main.ts
+```
+
+Only the exact value `false` disables persistence. Session-only mode still remembers exchanges until the process exits, subject to the context limits below.
+
+Say **“Jarvis, clear my conversation history”** to reset current context and attempt to persist empty history. The system prompt is preserved. In session-only mode, or if persistence was disabled after an error, this clears memory without changing saved history; the spoken response distinguishes that outcome from a confirmed full clear. Clearing history does not remove independently created backup copies.
+
+The model receives at most the **10 most recent completed turns**, trimmed further to **6,000 JavaScript string-length units** of historical message text. Complete oldest pairs are removed first. These limits apply at startup and during the session; the saved archive retains all completed turns until explicitly cleared. The system prompt and current request are outside the historical-text budget, which is not a model-token limit.
+
+If a history file is missing, JARVIS starts with empty history. If loading or saving fails, it reports the error and disables persistence for that session. A failed load is not automatically overwritten with empty history.
+
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
 To check types without compiling, run `npx tsc --noEmit`. The `npm test` script is currently a placeholder. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
@@ -161,7 +177,9 @@ JARVIS is being developed around several core responsibilities:
 
 ### Conversational AI
 
-Processes natural-language input, manages session history, and generates responses using a locally hosted language model.
+Processes natural-language input, manages recent conversational context, and generates responses using a locally hosted language model. `src/conversation/history.ts` validates a versioned JSON archive and selects bounded context. The controller restores user/assistant pairs after the current system prompt. New pairs enter history only after speech completes and the originating session is still current.
+
+History saves run through a serialized Promise queue using snapshots. Each save writes a unique temporary file beside the destination and renames it into place; failed writes or renames attempt temporary-file cleanup while preserving the original error. This prevents partial-file replacement during normal operation. It does not provide coordination between multiple concurrently running JARVIS instances or guaranteed durability through a power failure.
 
 ### Speech Recognition
 
@@ -186,6 +204,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Establish local LLM communication.
 - [x] Implement voice conversations with terminal feedback.
 - [x] Maintain conversation history.
+- [x] Persist completed exchanges across restarts, bound model context, and add session-only and history-clearing controls.
 - [x] Implement text-to-speech.
 - [x] Capture microphone audio.
 - [x] Integrate speech transcription.
@@ -198,7 +217,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Integrate native VoiceProcessingIO capture and Kokoro playback, with PCM streaming and a manual SoX fallback.
 - [ ] Improve wake-word reliability, failure recovery, and shutdown handling.
 - [ ] Improve conversational voice interaction.
-- [ ] Implement persistent memory.
+- [ ] Extend conversation history with long-term memory for selected facts and preferences.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
 
@@ -234,6 +253,8 @@ JARVIS is designed primarily for local execution.
 **Active Development**
 
 Milestone 9 native audio validation includes intelligible streamed audio, Whisper transcription, repeated wake-word interruption, silent-listening trials without reported self-activation, fallback operation, shutdown during speech, unexpected helper-exit cleanup, and acknowledged playback-timeout recovery. Missing STOP acknowledgement and forced termination were checked with simulated timers; echo suppression has not yet been quantitatively measured for production Kokoro playback.
+
+Milestone 10 history validation includes recall after restart, omission of interrupted exchanges and local commands, preservation of rejected history files, session-only operation without changing the saved file, and live session/persistent clearing. Isolated checks cover queued save ordering, snapshots, save-failure handling, atomic replacement cleanup, schema validation, and startup/runtime context limits. TypeScript and native audio self-tests pass. This is conversation-history persistence; automatic extraction or retrieval of long-term facts is not implemented.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 

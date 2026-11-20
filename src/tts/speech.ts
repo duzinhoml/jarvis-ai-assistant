@@ -5,7 +5,7 @@ import { kokoroSpeech } from "./kokoro.js";
 
 const execFileAsync = promisify(execFile);
 
-export const speak = async (text: string): Promise<void> => {
+export const speak = async (text: string): Promise<boolean> => {
   // try {
   //   await elevenLabs(text);
   // } catch (error) {
@@ -30,20 +30,23 @@ export const speak = async (text: string): Promise<void> => {
   // }
 
   try {
-    await kokoroSpeech(text);
+    return await kokoroSpeech(text);
   } catch (error) {
     const interrupted =
       error instanceof Error && "signal" in error && error.signal === "SIGINT";
-    if (interrupted) return;
+    if (interrupted) return false;
 
     if (
       error instanceof Error &&
       (error.message === "Kokoro worker is shutting down" ||
         error.message === "Kokoro worker is unavailable")
-    )
-      return;
+    ) {
+      return false;
+    }
 
     console.error("Failed to run Kokoro:", error);
     await execFileAsync("say", [text]);
+
+    return true;
   }
 };

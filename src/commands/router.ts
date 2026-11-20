@@ -8,7 +8,8 @@ export type LocalCommand =
   | "GET_BATTERY"
   | "OPEN_STUDY_MUSIC"
   | "PAUSE_MUSIC"
-  | "RESUME_MUSIC";
+  | "RESUME_MUSIC"
+  | "CLEAR_HISTORY";
 
 const LOCAL_COMMANDS = [
   "GET_TIME",
@@ -21,6 +22,7 @@ const LOCAL_COMMANDS = [
   "OPEN_STUDY_MUSIC",
   "PAUSE_MUSIC",
   "RESUME_MUSIC",
+  "CLEAR_HISTORY",
 ] as const;
 
 export const isValidLocalCommand = (value: string): value is LocalCommand => {

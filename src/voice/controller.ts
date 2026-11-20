@@ -8,7 +8,14 @@ import {
   AudioFrameBuffer,
   createWavBuffer,
 } from "../audio/index.js";
-import { processMessage, systemPrompt } from "../conversation/index.js";
+import {
+  loadConversationHistory,
+  processMessage,
+  saveConversationHistory,
+  systemPrompt,
+  type ConversationHistoryFile,
+  selectRecentTurns,
+} from "../conversation/index.js";
 import { writeFile, unlink } from "node:fs/promises";
 import { transcribeAudio } from "../stt/transcription.js";
 import { containsWakeWord, removeWakeWord } from "./wakeWord.js";
@@ -25,8 +32,58 @@ import {
 } from "../commands/index.js";
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
 import { createInterface } from "node:readline";
+import { resolve } from "node:path";
 
 export const startVoiceController = async (): Promise<void> => {
+  // Loading Conversation History
+  const historyFilePath = resolve("data/conversation-history.json");
+  let savedHistory: ConversationHistoryFile = { version: 1, turns: [] };
+  let historyPersistenceEnable = process.env.JARVIS_HISTORY_ENABLED !== "false";
+  let canPersistHistory: boolean = historyPersistenceEnable;
+
+  if (canPersistHistory) {
+    try {
+      savedHistory = await loadConversationHistory(historyFilePath);
+    } catch (error) {
+      console.warn(
+        "Saved conversation history could not be loaded. Continuing with session-only history; persistence is disabled for this session.",
+        error,
+      );
+      canPersistHistory = false;
+    }
+  } else {
+    console.warn(
+      "Conversation history persistence is disabled. Using session-only history.",
+    );
+  }
+
+  let historySaveQueue: Promise<void> = Promise.resolve();
+  const queueHistorySave = async (): Promise<void> => {
+    if (!canPersistHistory) return;
+
+    const snapshot: ConversationHistoryFile = {
+      version: 1,
+      turns: [...savedHistory.turns],
+    };
+
+    historySaveQueue = historySaveQueue.then(async () => {
+      if (!canPersistHistory) return;
+
+      try {
+        await saveConversationHistory(historyFilePath, snapshot);
+      } catch (error) {
+        canPersistHistory = false;
+        console.warn(
+          "Conversation history could not be saved. Continuing with session-only history; persistence is disabled for this session.",
+          error,
+        );
+      }
+    });
+
+    return historySaveQueue;
+  };
+
+  // VAD Initialization
   const VAD = await VADBuilder();
   const vad = new VAD(VADMode.VERY_AGGRESSIVE, 16000);
   const frameBuffer = new AudioFrameBuffer();
@@ -192,7 +249,26 @@ export const startVoiceController = async (): Promise<void> => {
     { role: "system", content: systemPrompt },
   ];
 
+  for (const turn of selectRecentTurns(savedHistory.turns)) {
+    conversationHistory.push({ role: "user", content: turn.userMessage });
+    conversationHistory.push({ role: "assistant", content: turn.aiResponse });
+  }
+
   let lastCommand: LocalCommand | null = null;
+
+  const resetConversationHistory = (): void => {
+    savedHistory.turns.length = 0;
+    conversationHistory.splice(1);
+    lastCommand = null;
+  };
+
+  const clearConversationHistory = async (): Promise<boolean> => {
+    await historySaveQueue;
+    resetConversationHistory();
+    await queueHistorySave();
+
+    return canPersistHistory;
+  };
 
   let state: ListeningState = "IDLE";
   console.log(state);
@@ -433,26 +509,43 @@ export const startVoiceController = async (): Promise<void> => {
         state = "SPEAKING";
         console.log("JARVIS is speaking...");
 
-        const commandResponse = await executeLocalCommand(
-          classification.command,
-        );
+        let commandResponse: string;
+        if (classification.command === "CLEAR_HISTORY") {
+          commandResponse = (await clearConversationHistory())
+            ? "Your current and saved conversation history have been cleared, Sir."
+            : "I've cleared this session's conversation history, but I couldn't confirm clearing the saved history, Sir.";
+        } else
+          commandResponse = await executeLocalCommand(classification.command);
 
         if (commandSessionId !== sessionId) return;
 
-        lastCommand = classification.command;
+        if (classification.command !== "CLEAR_HISTORY")
+          lastCommand = classification.command;
 
         console.log(`J.A.R.V.I.S.: ${commandResponse}`);
         await speak(commandResponse);
       } else if (classification.status === "NONE") {
         if (commandSessionId === sessionId) lastCommand = null;
 
-        await processMessage(cleanedTranscription, conversationHistory, () => {
-          if (commandSessionId !== sessionId) return false;
+        const completedTurn = await processMessage(
+          cleanedTranscription,
+          conversationHistory,
+          () => {
+            if (commandSessionId !== sessionId) return false;
 
-          state = "SPEAKING";
-          console.log("JARVIS is speaking...");
-          return true;
-        });
+            state = "SPEAKING";
+            console.log("JARVIS is speaking...");
+            return true;
+          },
+          () => {
+            return commandSessionId === sessionId && !isShuttingDown;
+          },
+        );
+
+        if (completedTurn !== null) {
+          savedHistory.turns.push(completedTurn);
+          await queueHistorySave();
+        }
       } else {
         console.error("JARVIS could not classify the request.");
         state = "SPEAKING";
