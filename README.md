@@ -1,6 +1,6 @@
 # JARVIS AI Assistant
 
-A voice-enabled, locally powered AI desktop assistant built with **TypeScript**, **Node.js**, and **Ollama** for macOS.
+A voice-enabled AI desktop assistant built with **TypeScript** and **Node.js** for macOS, using **OpenAI** for primary language-model requests and **Ollama** for local fallback.
 
 Inspired by Tony Stark's J.A.R.V.I.S. from the Iron Man films, this project aims to develop an intelligent, conversational assistant capable of understanding natural language, responding through speech, interacting with the operating system, and eventually integrating with physical hardware.
 
@@ -8,7 +8,7 @@ Inspired by Tony Stark's J.A.R.V.I.S. from the Iron Man films, this project aims
 
 JARVIS is a personal software engineering and artificial intelligence project focused on building a modular, extensible desktop assistant.
 
-Rather than relying entirely on cloud-based AI services, JARVIS uses locally hosted language models and speech-processing tools to support private, customizable interactions.
+JARVIS combines cloud-based language-model requests with local speech processing and local history/fact storage. OpenAI receives the context needed for classification and conversation; Ollama provides fallback inference for supported temporary failures.
 
 The long-term goal is to develop an increasingly autonomous assistant with contextual memory, advanced computer interaction, hardware integration, and eventually a custom-trained AI model.
 
@@ -16,7 +16,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 
 ### Implemented
 
-- **Local AI Conversations:** Generate responses using locally hosted language models through Ollama.
+- **AI Conversations:** Generate responses with OpenAI `gpt-6.1-terra`, with local Ollama `qwen3:1.7b` fallback for connection failures, rate limits, and server errors.
 - **Voice Activation:** Begin requests with “Jarvis,” “Hey Jarvis,” or “Hi Jarvis,” detected through local Whisper transcription.
 - **Terminal Feedback:** Display listening states, transcriptions, responses, and errors in the terminal.
 - **Text-to-Speech:** Generate spoken responses locally using Kokoro in a worker thread, with chunked playback through native VoiceProcessingIO. SoX mode uses macOS `afplay`; supported speech failures fall back to `say`.
@@ -24,11 +24,12 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Speech Recording:** Capture microphone input through native VoiceProcessingIO and stream 16 kHz mono Int16 PCM to TypeScript, with SoX available as a manual fallback.
 - **Speech Recognition:** Transcribe recorded audio using Whisper.
 - **Voice Activity Detection (VAD):** Detect speech and silence with WebRTC VAD and use listening timeouts to process requests.
-- **Intent Classification:** Route natural-language requests to approved commands, with limited context from the previous command.
+- **Intent Classification:** Use OpenAI with Ollama fallback to route natural-language requests to approved commands, retaining validation and limited previous-command context.
 - **macOS Integration:** Open Safari, Chrome, Visual Studio Code, and Finder. Retrieve the current time, date, and battery status.
 - **Music Commands:** Open a configured study playlist in Chrome and pause or resume Apple Music when explicitly named.
 - **Conversation History:** Save completed conversational exchanges locally and restore recent context across restarts, with session-only mode and an explicit history-clearing command.
 - **Explicit Long-Term Memory:** Remember, update, recall, list, and forget named facts in a separate local memory file, with validated commands and serialized updates.
+- **Memory-Aware Conversations:** Supply a bounded selection of relevant saved facts per conversational request, including learning preferences for recognized teaching requests.
 - **Assistant Personality:** Custom system instructions define JARVIS's conversational behavior.
 - **Error Handling:** Handle model execution failures and other runtime errors.
 
@@ -42,7 +43,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 
 ### Planned
 
-- Contextual use of saved facts in general conversation, beyond explicit memory commands.
+- Broader semantic retrieval of saved facts beyond keyword matching.
 - Context-aware interactions and improved reasoning.
 - Expanded macOS automation.
 - Hardware integration using Arduino.
@@ -56,8 +57,8 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 | ------------ | ----------------------------------- |
 | TypeScript   | Primary programming language        |
 | Node.js      | Application runtime                 |
-| Ollama       | Local LLM execution                 |
-| Qwen         | Local conversational language model |
+| OpenAI / GPT-6.1 Terra | Primary intent classification and conversation |
+| Ollama / Qwen | Local fallback classification and conversation |
 | Whisper.cpp  | Speech-to-text transcription        |
 | Swift / VoiceProcessingIO | Native microphone capture, speech playback, and voice processing |
 | SoX          | Fallback microphone capture and resampling |
@@ -74,11 +75,12 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - macOS
 - Node.js and npm
 - Swift toolchain with the `Synchronization` module (used by the native audio backend)
-- Ollama
+- OpenAI API access to `gpt-6.1-terra`
+- Ollama and its downloaded model for local fallback
 - SoX
 - Whisper.cpp
 - A working microphone with access granted to the terminal or IDE
-- Internet access for initial model downloads
+- Internet access for OpenAI requests and initial model downloads
 
 ### Installation
 
@@ -99,11 +101,13 @@ npm install
 
 Download Ollama from [ollama.com](https://ollama.com).
 
-Ensure Ollama is running at `http://localhost:11434`, then pull the model used for conversations and intent classification:
+Ensure Ollama is running at `http://localhost:11434`, then pull the fallback model for conversations and intent classification:
 
 ```bash
 ollama pull qwen3:1.7b
 ```
+
+Ollama is not required for successful primary OpenAI requests. It must be running for local fallback; if both providers fail, JARVIS reports failure instead of executing an unclassified command.
 
 **4. Install audio dependencies**
 
@@ -117,7 +121,7 @@ Download the Whisper English base model and place it at `models/ggml-base.en.bin
 
 **5. Configure the application**
 
-Ensure executable paths and model locations match your system. The default voice flow does not require API keys.
+Ensure executable paths and model locations match your system. Configure `OPENAI_API_KEY` privately for the primary language-model requests. Startup uses Node's `loadEnvFile` before launching the controller; run from the project root with the expected local configuration file available. Never put credential values in source code, logs, or commits.
 
 Kokoro downloads its model on first use and uses the `bm_daniel` voice. The optional ElevenLabs integration is not enabled in the default speech flow.
 
@@ -182,7 +186,11 @@ Fact storage is independent of `JARVIS_HISTORY_ENABLED=false`. That setting disa
 
 A missing memory file starts an empty fact store. Invalid files disable memory updates for that session without overwriting the rejected file. Failed saves retain the previous active facts and disable further writes. Successful memory changes are acknowledged only after saving. Recall/list use the active fact store; startup warnings report when that store could not be loaded.
 
-This milestone supports explicit fact commands. Facts are not automatically extracted from normal conversation or injected into general conversational prompts, so remembering a preference does not yet automatically change JARVIS's behavior. Semantic key matching and payload extraction still depend on the model; the literal recall fallback does not resolve synonyms or spelling variants by itself.
+Saved facts now also inform general conversations. `src/memory/context.ts` compares lowercase ASCII word tokens in fact keys with the current request, ignoring common key words. The `learning_preference` key instead qualifies when the request contains `explain` or `teach`. This is keyword matching, not semantic retrieval; synonyms, implicit teaching requests, and follow-ups without matching words can miss relevant facts.
+
+Selection takes the first **10 relevant facts in stored order**, then removes facts from the end until their serialized JSON fits **2,000 JavaScript string-length units**. An oversized first selected fact can leave no memory context. The full fact store is unchanged. The wrapper and system prompt are outside this budget, which is not a token limit.
+
+The selected snapshot is wrapped as untrusted reference data in a request-only message before the user's actual request. It is not appended to conversation history. Current requests override stored preferences; updates and forgetting affect subsequent snapshots. Completed answers can still mention facts and remain in history until cleared. Prompt boundaries reduce instruction confusion but do not guarantee resistance to arbitrary embedded instructions. Semantic key matching and command-payload extraction remain model-dependent.
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
@@ -200,7 +208,11 @@ JARVIS is being developed around several core responsibilities:
 
 ### Conversational AI
 
-Processes natural-language input, manages recent conversational context, and generates responses using a locally hosted language model. `src/conversation/history.ts` validates a versioned JSON archive and selects bounded context. The controller restores user/assistant pairs after the current system prompt. New pairs enter history only after speech completes and the originating session is still current.
+Processes natural-language input, manages recent conversational context, and generates responses through OpenAI's Responses API using `gpt-6.1-terra` and `store: false`. The request contains the current system prompt, bounded history, selected saved facts when relevant, and the current user message. `src/conversation/history.ts` validates the versioned archive. New pairs enter history only after speech completes and the originating session is still current.
+
+Both OpenAI clients use a 30-second timeout with SDK retries disabled. Connection errors (including timeouts), HTTP 429, and HTTP 5xx permit Ollama fallback. Authentication/configuration errors, incomplete OpenAI responses, and empty conversational output do not trigger fallback. OpenAI responses must have status `completed`. Local fallback requests also have 30-second abort signals; classification uses `/api/generate`, and conversation uses `/api/chat`. Classification and conversation are separate stages, so their timeouts can accumulate. These are not a single end-to-end deadline.
+
+An obsolete conversation skips starting fallback after an OpenAI failure; existing session guards suppress stale speech/history. In-flight provider requests are not generally cancelled on barge-in. Fallback warnings identify whether classification or response generation switched providers. The local model remains less reliable at following learning preferences than the primary model.
 
 History saves run through a serialized Promise queue using snapshots. Each save writes a unique temporary file beside the destination and renames it into place; failed writes or renames attempt temporary-file cleanup while preserving the original error. This prevents partial-file replacement during normal operation. It does not provide coordination between multiple concurrently running JARVIS instances or guaranteed durability through a power failure.
 
@@ -216,7 +228,7 @@ SoX mode retains `afplay` playback. The speech wrapper uses `say` for supported 
 
 ### Intent Classification
 
-Uses a separate Ollama prompt to distinguish conversational messages, approved local commands, and structured memory actions. Local commands remain identifiers; memory responses are JSON parsed as `unknown` and checked with `isMemoryCommand()` before routing. Existing memory keys are supplied to help the model reuse fact names. Limited previous-local-command context supports related follow-up requests. Explicit list phrases bypass the model; write/delete guards and a missing-fact recall fallback supplement model classification.
+Uses a separate OpenAI request, with Ollama fallback, to distinguish conversational messages, approved local commands, and memory actions. Output is text: local commands remain allowlisted identifiers; memory objects are JSON parsed as `unknown` and checked with `isMemoryCommand()` before routing. This is runtime validation, not API-enforced structured output. Existing memory keys help the model reuse fact names; values are not supplied to classification. Limited previous-local-command context, explicit-list shortcuts, write/delete guards, and the missing-fact recall fallback remain in place. Failed classification returns `ERROR` without executing a command.
 
 ### Explicit Memory
 
@@ -247,7 +259,8 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [ ] Improve wake-word reliability, failure recovery, and shutdown handling.
 - [ ] Improve conversational voice interaction.
 - [x] Add a separate explicit fact store with remember, update, recall, review, and targeted forgetting.
-- [ ] Use selected saved facts as context in general conversation.
+- [x] Use selected saved facts as bounded context in general conversation.
+- [x] Add OpenAI classification and conversation with validated routing and local Ollama fallback.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
 
@@ -268,9 +281,11 @@ The project is intended to evolve alongside my knowledge of software engineering
 
 ## Security and Privacy
 
-JARVIS is designed primarily for local execution.
+JARVIS uses a hybrid local/cloud architecture.
 
-- Local language model inference is handled through Ollama.
+- Primary classification sends the classification prompt, current utterance, known memory keys, and relevant previous-command context to OpenAI. Conversation sends the current system prompt, bounded recent exchanges, selected relevant fact values, and the current utterance.
+- `store: false` is set on Responses API requests; it does not make inference local or establish a blanket zero-retention guarantee.
+- Local fallback inference is handled through Ollama. It is availability fallback, not a selectable offline-only mode; primary requests still try OpenAI first.
 - Whisper transcription and default Kokoro speech synthesis run locally after model downloads.
 - The optional ElevenLabs integration sends text to an external service when enabled.
 - Sensitive configuration files and credentials should not be committed.
@@ -288,6 +303,8 @@ Milestone 9 native audio validation includes intelligible streamed audio, Whispe
 Milestone 10 history validation includes recall after restart, omission of interrupted exchanges and local commands, preservation of rejected history files, session-only operation without changing the saved file, and live session/persistent clearing. Isolated checks cover queued save ordering, snapshots, save-failure handling, atomic replacement cleanup, schema validation, and startup/runtime context limits. TypeScript and native audio self-tests passed at closeout. That milestone established conversation-history persistence rather than a separate fact store.
 
 Milestone 11 adds explicit fact storage. Live tests verified remembering, recall after restart, listing, update without duplication, persistent forgetting, missing-fact responses, independence from conversation-history clearing, and refusal to overwrite an unsupported memory-file version. Isolated checks cover validation, command guards, parsing, queued updates, persistence failure, and temporary-file cleanup. The small model produced inconsistent list and missing-fact classifications during development; the documented code-level shortcuts, guards, and recall fallback were added in response. Arbitrary wording and semantic key matching remain model-dependent. TypeScript and whitespace checks pass; isolated memory checks are not yet a committed automated test suite.
+
+Milestone 12 adds bounded, request-specific memory context and OpenAI primary classification/conversation with local fallback. User-run tests verified relevant personalization, saved learning-preference use and an explicit solution override, updated and forgotten facts across restarts, preservation of other facts, and interruption. Both primary paths worked with Ollama stopped. Separate injected connection failures exercised classification and conversation fallback; the injections and diagnostic prompt were removed. A saved instruction-attempt phrase was discussed as data without changing identity in the tested case. TypeScript and whitespace checks passed. Local fallback still has weaker instruction following; keyword retrieval and prompt boundaries are not general semantic or security guarantees. Timeout and incomplete-response guards were reviewed, but live timeout-expiry and incomplete-response failure cases were not separately exercised.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 

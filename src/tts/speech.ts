@@ -7,11 +7,11 @@ const execFileAsync = promisify(execFile);
 
 export const speak = async (text: string): Promise<boolean> => {
   // try {
-  //   await elevenLabs(text);
+  //   return await elevenLabs(text);
   // } catch (error) {
   //   const interrupted =
   //     error instanceof Error && "signal" in error && error.signal === "SIGINT";
-  //   if (interrupted) return;
+  //   if (interrupted) return false;
 
   //   console.log("Failed to run ElevenLabs:", error);
 

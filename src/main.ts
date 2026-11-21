@@ -1,5 +1,8 @@
 import { startVoiceController } from "./voice/controller.js";
 import { shutdownKokoroWorker } from "./tts/kokoro.js";
+import { loadEnvFile } from "node:process";
+
+loadEnvFile(".env");
 
 const main = async (): Promise<void> => {
   console.log("Initializing J.A.R.V.I.S...");

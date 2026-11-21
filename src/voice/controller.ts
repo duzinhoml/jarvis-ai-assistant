@@ -684,6 +684,7 @@ export const startVoiceController = async (): Promise<void> => {
           () => {
             return commandSessionId === sessionId && !isShuttingDown;
           },
+          [...savedMemory.facts],
         );
 
         if (completedTurn !== null) {

@@ -1,3 +1,4 @@
+import OpenAI from "openai";
 import { type LocalCommand, isValidLocalCommand } from "./router.js";
 import { type MemoryCommand, isMemoryCommand } from "../memory/index.js";
 
@@ -573,30 +574,69 @@ export const classifyIntent = async (
 `;
 
   try {
-    const response = await fetch("http://localhost:11434/api/generate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "qwen3:1.7b",
-        prompt: classificationPrompt,
-        stream: false,
-      }),
-    });
+    let classificationText: string;
 
-    if (!response.ok) {
-      console.error("Error occured:", response.status);
-      return { status: "ERROR" };
+    try {
+      const client = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY,
+        timeout: 30000,
+        maxRetries: 0,
+      });
+
+      const response = await client.responses.create({
+        model: "gpt-6.1-terra",
+        input: classificationPrompt,
+        store: false,
+      });
+
+      if (response.status !== "completed")
+        throw new Error("OpenAI did not complete the request.");
+
+      classificationText = response.output_text;
+    } catch (error) {
+      const canFallback: boolean =
+        error instanceof OpenAI.APIConnectionError ||
+        (error instanceof OpenAI.APIError &&
+          typeof error.status === "number" &&
+          (error.status === 429 || error.status >= 500));
+
+      if (!canFallback)
+        throw new Error(
+          "OpenAI classification failed. Check API access and request configuration.",
+        );
+
+      console.warn(
+        "OpenAI classification is temporarily unavailable. Using local Ollama fallback.",
+      );
+
+      const response = await fetch("http://localhost:11434/api/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "qwen3:1.7b",
+          prompt: classificationPrompt,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+
+      if (!response.ok) {
+        console.error("Error occured:", response.status);
+        return { status: "ERROR" };
+      }
+
+      const data = await response.json();
+      if (typeof data.response !== "string") {
+        console.error("Invalid data type.");
+        return { status: "ERROR" };
+      }
+
+      classificationText = data.response;
     }
 
-    const data = await response.json();
-    if (typeof data.response !== "string") {
-      console.error("Invalid data type.");
-      return { status: "ERROR" };
-    }
-
-    const aiOutput = data.response.trim();
+    const aiOutput = classificationText.trim();
     if (aiOutput === "NONE") {
       const recallKey = extractMemoryRecallKey(input);
       if (recallKey)
@@ -633,7 +673,7 @@ export const classifyIntent = async (
 
     return { status: "ERROR" };
   } catch (error) {
-    console.error("Error occurred:", error);
+    console.error("Intent classification failed. No command was executed.");
     return { status: "ERROR" };
   }
 };

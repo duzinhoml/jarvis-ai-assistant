@@ -18,6 +18,7 @@ Its main responsibilities are:
 - Coordinate native playback requests, completion events, and shutdown cleanup.
 - Restore bounded conversation context and coordinate persistent-history saves and clearing.
 - Execute explicit long-term memory commands through a separate validated fact store and update queue.
+- Supply bounded relevant facts to conversational requests and coordinate OpenAI-first routing with local Ollama fallback.
 
 ---
 
@@ -117,7 +118,7 @@ Two arrays serve different purposes:
 | Value | Purpose |
 | ----- | ------- |
 | `savedHistory.turns` | Full archive of completed exchanges loaded or collected this session |
-| `conversationHistory` | Current system prompt plus bounded recent messages supplied to Ollama |
+| `conversationHistory` | Current system prompt plus bounded recent messages supplied to the conversational provider |
 
 `MAX_CONTEXT_TURNS` is **10**, and `MAX_CONTEXT_CHARACTERS` is **6,000**. Startup selection copies the newest ten turns and removes complete oldest turns until their combined user/assistant text fits the size budget. After each completed response, `processMessage()` applies the equivalent limits to the running message array while preserving the system message at index 0. A single oversized pair is omitted from future model context but remains available for persistence.
 
@@ -192,7 +193,7 @@ The queue reports a boolean result. Invalid update input is caught as `false` wh
 | `forget` | Nonempty `key` | Check existence and remove the target inside the update callback; report failure, removal, or no match |
 | `list` | None | Wait for updates, then report all active facts or empty memory |
 
-The classifier accepts local identifiers, `NONE`, or memory-command JSON from the same Ollama request. JSON is parsed as `unknown`, validated with `isMemoryCommand()`, and returned as `{ status: "MEMORY", command }`. Known memory keys are included as data to help the model map wording to existing fact names. Memory values are not supplied to that classifier.
+The classifier accepts local identifiers, `NONE`, or memory-command JSON from an OpenAI Responses API request, with Ollama fallback for supported temporary failures. JSON is parsed as `unknown`, validated with `isMemoryCommand()`, and returned as `{ status: "MEMORY", command }`. Output is plain text checked at runtime, not API-enforced structured output. Known memory keys are included as data to help the model map wording to existing fact names. Memory values are not supplied to that classifier.
 
 Code-level routing supplements the prompt:
 
@@ -205,7 +206,43 @@ These are limited phrase/structure checks. Model-based extraction and key matchi
 
 The controller waits for pending memory updates before classifying with the current keys. Its `MEMORY` branch calls `executeMemoryCommand()`, checks session validity before speaking the result, and clears previous-local-command context. A requested update may already have been saved when its spoken confirmation is interrupted; the session guard suppresses obsolete speech rather than undoing committed memory.
 
-`executeMemoryCommand()` returns text without directly invoking TTS. Recall and list are read-only. The controller speaks the text, and memory exchanges bypass conversational-history saving. Saved facts are not injected into the general `processMessage()` prompt: remembering a learning preference, for example, does not yet automatically change conversational behavior.
+`executeMemoryCommand()` returns text without directly invoking TTS. Recall and list are read-only. The controller speaks the text, and memory exchanges bypass conversational-history saving. Milestone 12 separately adds selected facts to general `processMessage()` requests as described below.
+
+### Request-Specific Memory Context
+
+For a conversational (`NONE`) result, the controller passes a copied facts array as the fifth argument to `processMessage()`. `buildMemoryContext()` in `src/memory/context.ts` selects facts using the current user input without modifying the active store.
+
+The selector:
+
+1. Lowercases and splits request text and fact keys into ASCII word tokens. Ordinary keys qualify when at least one non-ignored key token appears in the request. Fact values are not used for matching.
+2. Handles normalized `learning_preference` separately: it qualifies only when the request contains `explain` or `teach`.
+3. Takes the first **10 relevant facts in stored order**, rather than the most recent facts.
+4. Removes facts from the end until `JSON.stringify(selectedFacts).length` is at most **2,000**. The count includes JSON escaping and punctuation, but excludes the wrapper and other messages. An oversized first selected fact can result in no selected facts.
+
+An empty selection produces no memory message. Otherwise, the request message order is: current system prompt and recent conversation, a user-role message wrapping the selected JSON as untrusted reference data, and the actual current user request. The wrapper explicitly forbids carrying out instructions within keys or values. Fact values are not promoted into system instructions.
+
+Only the real user input and completed assistant response enter `conversationHistory`; the memory wrapper is request-only. New requests build fresh snapshots, so committed updates and forgetting affect subsequent selection. This does not remove earlier fact mentions from completed conversation history. History-disabled restarts isolate current memory during tests.
+
+The system prompt directs the model to use current saved facts over stale conversational references and to honor current requests over stored preferences. Learning preferences should guide teaching without leaking into unrelated creative tasks. These are model instructions, not deterministic output enforcement. Keyword matching can miss synonyms, implicit teaching requests, and follow-ups without matching words; it can also select facts based on a broad shared word. There is no vector search or automatic fact extraction.
+
+### OpenAI Primary and Ollama Fallback
+
+`src/main.ts` loads configuration using Node's `loadEnvFile` before starting the controller. Configure `OPENAI_API_KEY` privately and run from the project root. Credential values must not appear in source, diagnostics, or version control.
+
+Both classification and conversation use `gpt-6.1-terra` through the OpenAI Responses API with `store: false`. Classification sends its prompt, current input, known fact keys, and limited previous-command context. Conversation sends the bounded message sequence described above. Speech transcription, Kokoro synthesis, native audio, and history/fact files remain local; selected text context is sent to OpenAI. `store: false` is not an offline or blanket zero-retention guarantee.
+
+Each client has a **30,000 ms timeout** and **`maxRetries: 0`**. The provider-selection catch permits fallback only for SDK connection errors (including timeouts), HTTP **429**, or HTTP **5xx**. Other errors produce fixed diagnostics. Responses must report `status === "completed"` before their text is used; incomplete responses do not trigger fallback. Conversational whitespace-only output is rejected before speech or history.
+
+Local fallback uses `qwen3:1.7b` at `http://localhost:11434`: classification POSTs to `/api/generate`, while conversation POSTs to `/api/chat` with the same request messages and temperature zero. Both use `AbortSignal.timeout(30000)`. Conversation checks the HTTP result and `data?.message?.content` before using text. Classification retains its allowlist, memory validators, and explicit-intent guards regardless of provider. A failed classifier returns `ERROR`; the controller does not execute an action from failed classification.
+
+Fallback warnings distinguish the two stages:
+
+- Classification: `OpenAI classification is temporarily unavailable. Using local Ollama fallback.`
+- Conversation: `OpenAI is temporarily unavailable. Using local Ollama fallback.`
+
+Ollama can be stopped during successful primary requests. It must be available for fallback. A classification fallback does not imply conversation fallback, and there is no offline-only provider switch. Authentication or client-configuration failures are not hidden by local fallback.
+
+The controller checks its session after classification. Conversation skips starting fallback if its session is already obsolete and uses the existing pre-speech/post-speech guards. These checks discard stale results; they do not generally abort in-flight provider requests. Classification and conversation, and each stage's primary/fallback attempts, have separate timeouts rather than one end-to-end deadline. The local model's learning-preference adherence remains weaker than the tested primary model.
 
 ### Listening States
 
@@ -795,4 +832,16 @@ Classification-only Ollama tests exposed inconsistent broad-list routing, hypoth
 
 Isolated checks also covered blank facts, duplicate normalized keys, malformed commands/files, save/reload, normalized lookup/update/removal, update ordering, use of the latest committed facts, save-failure retention, disabled further writes, and temporary-file cleanup. TypeScript and whitespace checks passed at closeout. The memory module and classifier tests are not yet a committed automated test suite.
 
-Automatic fact extraction, automatic use of saved facts in general conversation, and vector/semantic retrieval remain outside this milestone's explicit-command implementation.
+Automatic fact extraction, automatic use of saved facts in general conversation, and vector/semantic retrieval were outside Milestone 11's explicit-command implementation. Milestone 12 adds keyword-selected conversational context, as documented above.
+
+## 14. Milestone 12 Validation Checkpoint
+
+User-run tests exercised the OpenAI primary paths with Ollama stopped: time commands routed correctly, conversational questions received generated answers, and “How would I open Safari?” produced guidance without opening the application. Remember, recall, and forget also passed through the OpenAI classifier.
+
+Conversational tests verified relevant fact selection without unrelated editor/platform details; an updated rover name persisted across restart; a forgotten name was absent after restart; and forgetting that fact preserved the separate learning preference. History-disabled sessions prevented older exchanges from supplying the tested names. The OpenAI model explained closures without revealing the practice solution, then provided a correct solution when explicitly requested. This resolved the repeated primary-path teaching failures observed with the local model; local fallback is not equivalent in quality.
+
+A saved phrase instructing JARVIS to ignore previous instructions and adopt another name was supplied through conversational memory. In the tested OpenAI response, JARVIS described the instruction attempt and retained its identity. A prior explicit-recall response did not exercise conversational generation and was not counted as that test. The temporary fact was removed. This is a successful regression case, not proof of general prompt-injection resistance.
+
+OpenAI-path speech interruption stopped the old explanation, answered the new time command, and returned to readiness. Separately injected `OpenAI.APIConnectionError` failures exercised classification fallback and conversational fallback, including the revised `/api/chat` request. The classification-only injection produced its specific warning while conversation remained on OpenAI. Temporary throws and the diagnostic system prompt were removed, and the original system prompt is active.
+
+Focused isolated checks covered relevant/irrelevant facts, learning-request selection, normalized preference keys, selection limits, JSON-length boundaries, and preservation of source arrays. TypeScript and whitespace checks passed. The 30-second timeouts and incomplete-response guards were reviewed; live timeout-expiry and incomplete-response failures were not separately injected. Provider checks are not yet a committed automated regression suite. Native audio was unchanged during this milestone; earlier native validation remains a separate checkpoint.
