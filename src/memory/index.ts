@@ -11,7 +11,7 @@ import {
   removeMemoryFact,
 } from "./operations.js";
 import { loadMemoryFile, saveMemoryFile } from "./storage.js";
-import { buildMemoryContext } from "./context.js";
+import { buildMemoryContext, selectMemoryContextFacts } from "./context.js";
 
 export {
   type MemoryFact,
@@ -27,4 +27,5 @@ export {
   loadMemoryFile,
   saveMemoryFile,
   buildMemoryContext,
+  selectMemoryContextFacts,
 };

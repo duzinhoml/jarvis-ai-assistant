@@ -186,15 +186,21 @@ Fact storage is independent of `JARVIS_HISTORY_ENABLED=false`. That setting disa
 
 A missing memory file starts an empty fact store. Invalid files disable memory updates for that session without overwriting the rejected file. Failed saves retain the previous active facts and disable further writes. Successful memory changes are acknowledged only after saving. Recall/list use the active fact store; startup warnings report when that store could not be loaded.
 
-Saved facts now also inform general conversations. `src/memory/context.ts` compares lowercase ASCII word tokens in fact keys with the current request, ignoring common key words. The `learning_preference` key instead qualifies when the request contains `explain` or `teach`. This is keyword matching, not semantic retrieval; synonyms, implicit teaching requests, and follow-ups without matching words can miss relevant facts.
+Saved facts also inform general conversations. `src/memory/context.ts` compares distinct lowercase ASCII word tokens in fact keys with the current request, ignoring common key words. Retrieval normalizes `colour` to `color` and `favourite` to `favorite` on both sides without changing stored keys. Fact values do not influence matching. The normalized `learning_preference` key scores 1 for current requests containing `explain`, `teach`, `help me understand`, or `walk me through`, with complete-word matching; otherwise it scores 0.
 
-Selection takes the first **10 relevant facts in stored order**, then removes facts from the end until their serialized JSON fits **2,000 JavaScript string-length units**. An oversized first selected fact can leave no memory context. The full fact store is unchanged. The wrapper and system prompt are outside this budget, which is not a token limit.
+Supported follow-up prefixes are `what color is it`, `what about its`, `how about its`, and `tell me more about it`. After token normalization, these requests can use the first **500 characters of the latest completed conversational user message** as additional retrieval text. Other requests do not inherit that context. The actual user message sent to the model is unchanged, and learning-preference detection uses only the current request.
+
+Ordinary fact scores are `currentMatches + contextOnlyMatches / (contextOnlyMatches + 1)`. Each distinct meaningful key word contributes once: current-question matches take priority over any number of inherited-only matches. Zero-score facts are excluded; positive scores sort highest first, with stored order breaking ties. Scores are recalculated per conversational request and are not saved.
+
+Selection walks that ranking and accepts up to **10 facts** within **2,000 JavaScript string-length units** of serialized JSON. Facts that do not fit are skipped so smaller useful facts can still be selected, including beyond the first ten candidates. The full store is unchanged. JSON escaping and punctuation count toward the budget; the wrapper and system prompt do not. This is not a token limit or optimal packing algorithm.
+
+Retrieval remains lexical: it does not resolve general synonyms or ambiguous pronouns, and it does not carry an inferred subject across multiple follow-up turns. Broad shared words may select unrelated facts. Embeddings, general semantic retrieval, and automatic fact extraction are future work.
 
 The selected snapshot is wrapped as untrusted reference data in a request-only message before the user's actual request. It is not appended to conversation history. Current requests override stored preferences; updates and forgetting affect subsequent snapshots. Completed answers can still mention facts and remain in history until cleared. Prompt boundaries reduce instruction confusion but do not guarantee resistance to arbitrary embedded instructions. Semantic key matching and command-payload extraction remain model-dependent.
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
-To check types without compiling, run `npx tsc --noEmit`. The `npm test` script is currently a placeholder. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
+To check types without compiling, run `npx tsc --noEmit`. Run `npm test` for the 15 isolated memory-retrieval regression tests in `src/tests/memory-context.ts`; these use synthetic facts without reading saved memory, loading credentials, starting audio, or making model requests. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
 
 ```bash
 swift native/audio/main.swift --test-streaming-buffer
@@ -260,6 +266,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [ ] Improve conversational voice interaction.
 - [x] Add a separate explicit fact store with remember, update, recall, review, and targeted forgetting.
 - [x] Use selected saved facts as bounded context in general conversation.
+- [x] Rank memory by current-request relevance, pack the context budget, normalize spelling aliases, and support bounded follow-ups with regression tests.
 - [x] Add OpenAI classification and conversation with validated routing and local Ollama fallback.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
@@ -305,6 +312,8 @@ Milestone 10 history validation includes recall after restart, omission of inter
 Milestone 11 adds explicit fact storage. Live tests verified remembering, recall after restart, listing, update without duplication, persistent forgetting, missing-fact responses, independence from conversation-history clearing, and refusal to overwrite an unsupported memory-file version. Isolated checks cover validation, command guards, parsing, queued updates, persistence failure, and temporary-file cleanup. The small model produced inconsistent list and missing-fact classifications during development; the documented code-level shortcuts, guards, and recall fallback were added in response. Arbitrary wording and semantic key matching remain model-dependent. TypeScript and whitespace checks pass; isolated memory checks are not yet a committed automated test suite.
 
 Milestone 12 adds bounded, request-specific memory context and OpenAI primary classification/conversation with local fallback. User-run tests verified relevant personalization, saved learning-preference use and an explicit solution override, updated and forgotten facts across restarts, preservation of other facts, and interruption. Both primary paths worked with Ollama stopped. Separate injected connection failures exercised classification and conversation fallback; the injections and diagnostic prompt were removed. A saved instruction-attempt phrase was discussed as data without changing identity in the tested case. TypeScript and whitespace checks passed. Local fallback still has weaker instruction following; keyword retrieval and prompt boundaries are not general semantic or security guarantees. Timeout and incomplete-response guards were reviewed, but live timeout-expiry and incomplete-response failure cases were not separately exercised.
+
+Milestone 13 improves retrieval with current-request-first scoring, stable ties, skip-and-continue budget packing, spelling aliases, broader teaching cues, and limited previous-request context. Live trials verified a rover-color follow-up, a switch to teaching promises without rover references, and conversational continuity on a later promises follow-up. Isolated integration checks separately verified the request-only memory snapshot. A crowded-memory edge case initially excluded the answer behind ten old-subject matches; revised scoring fixes it and has a regression test. All 15 `npm test` cases, TypeScript, and whitespace checks pass. General semantic retrieval and multi-turn subject tracking remain future work.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 

@@ -210,20 +210,23 @@ The controller waits for pending memory updates before classifying with the curr
 
 ### Request-Specific Memory Context
 
-For a conversational (`NONE`) result, the controller passes a copied facts array as the fifth argument to `processMessage()`. `buildMemoryContext()` in `src/memory/context.ts` selects facts using the current user input without modifying the active store.
+For a conversational (`NONE`) result, the controller passes a copied facts array as the fifth argument to `processMessage()`. That function filters `conversationHistory` for user messages and uses `.at(-1)` to obtain the latest completed conversational user message. Its content is the optional third argument to `buildMemoryContext()` in `src/memory/context.ts`. Selection does not modify the active store.
 
 The selector:
 
-1. Lowercases and splits request text and fact keys into ASCII word tokens. Ordinary keys qualify when at least one non-ignored key token appears in the request. Fact values are not used for matching.
-2. Handles normalized `learning_preference` separately: it qualifies only when the request contains `explain` or `teach`.
-3. Takes the first **10 relevant facts in stored order**, rather than the most recent facts.
-4. Removes facts from the end until `JSON.stringify(selectedFacts).length` is at most **2,000**. The count includes JSON escaping and punctuation, but excludes the wrapper and other messages. An oversized first selected fact can result in no selected facts.
+1. Lowercases and splits keys and requests into ASCII word tokens, normalizing `colour` to `color` and `favourite` to `favorite`. Distinct key tokens are counted once and common key words are ignored. Fact values do not affect matching; stored keys remain unchanged.
+2. Handles normalized `learning_preference` separately: score 1 for current requests containing the complete words `explain` or `teach`, or consecutive phrases `help me understand` or `walk me through`; otherwise score 0. Previous teaching cues are not inherited.
+3. For ordinary facts, obtains retrieval text using `buildMemoryRetrievalText()`. Recognized follow-up prefixes (`what color is it`, `what about its`, `how about its`, `tell me more about it`) append at most the first **500 characters** of the previous user request, if nonblank. Other inputs use only the current request. Prefixes match normalized complete words; this is not general pronoun resolution.
+4. Uses `scoreMemoryFact()` to calculate `currentMatches + contextOnlyMatches / (contextOnlyMatches + 1)`. A key token matching the current request is not counted again as context. The inherited fraction stays below 1, so a fact answering the current question outranks facts matching only the previous subject. Scores are temporary, not persisted.
+5. Excludes score-zero facts and sorts positive scores descending. Ties preserve stored order. It then walks all ranked candidates, selecting at most **10** facts while `JSON.stringify(selectedFacts).length` stays at most **2,000**. Oversized candidates are skipped, not allowed to block later smaller facts. JSON escaping and punctuation count; the wrapper and other messages do not. This is greedy packing, not an optimization for maximum information.
+
+For example, with current request “What color is it?” and previous request “Describe my test rover”, `rover_color` scores 1.5 while `test_rover` scores about 0.67. The current answer can no longer lose its slot merely because ten earlier facts match the old subject. The original user input remains separate and unchanged; combined text is for retrieval only.
 
 An empty selection produces no memory message. Otherwise, the request message order is: current system prompt and recent conversation, a user-role message wrapping the selected JSON as untrusted reference data, and the actual current user request. The wrapper explicitly forbids carrying out instructions within keys or values. Fact values are not promoted into system instructions.
 
 Only the real user input and completed assistant response enter `conversationHistory`; the memory wrapper is request-only. New requests build fresh snapshots, so committed updates and forgetting affect subsequent selection. This does not remove earlier fact mentions from completed conversation history. History-disabled restarts isolate current memory during tests.
 
-The system prompt directs the model to use current saved facts over stale conversational references and to honor current requests over stored preferences. Learning preferences should guide teaching without leaking into unrelated creative tasks. These are model instructions, not deterministic output enforcement. Keyword matching can miss synonyms, implicit teaching requests, and follow-ups without matching words; it can also select facts based on a broad shared word. There is no vector search or automatic fact extraction.
+The system prompt directs the model to use current saved facts over stale conversational references and to honor current requests over stored preferences. Learning preferences should guide teaching without leaking into unrelated creative tasks. These are model instructions, not deterministic output enforcement. Lexical matching can miss synonyms, implicit teaching requests, and unsupported follow-ups; broad shared words can select unrelated facts. Only the previous completed conversational user message supplies retrieval context, so a subject is not tracked across repeated pronoun-only turns. Commands and interrupted exchanges do not enter that history. Truncation can also omit a subject beyond the first 500 characters. There is no vector search or automatic fact extraction.
 
 ### OpenAI Primary and Ollama Fallback
 
@@ -820,7 +823,7 @@ Live tests verified history-file creation and recall after restart; omission of 
 
 Isolated checks verified serialized saves and snapshot contents, clearing after a pending save, disabling writes after load/save failures, original-file preservation and temporary-file cleanup on rename failure, malformed JSON and schema rejection, and startup/runtime turn and text-size limits. Interrupted and obsolete responses did not modify model context. These checks used temporary fixtures or substituted I/O, without changing the user's saved history.
 
-The final closeout checks also passed TypeScript checking, whitespace checks, native compilation, and all three native offline self-tests. The npm test script remains a placeholder; these isolated history checks are not yet a committed automated test suite.
+The final Milestone 10 closeout checks also passed TypeScript checking, whitespace checks, native compilation, and all three native offline self-tests. At that checkpoint the npm test script was a placeholder; those isolated history checks are not part of the memory-retrieval suite introduced in Milestone 13.
 
 ## 13. Milestone 11 Validation Checkpoint
 
@@ -845,3 +848,15 @@ A saved phrase instructing JARVIS to ignore previous instructions and adopt anot
 OpenAI-path speech interruption stopped the old explanation, answered the new time command, and returned to readiness. Separately injected `OpenAI.APIConnectionError` failures exercised classification fallback and conversational fallback, including the revised `/api/chat` request. The classification-only injection produced its specific warning while conversation remained on OpenAI. Temporary throws and the diagnostic system prompt were removed, and the original system prompt is active.
 
 Focused isolated checks covered relevant/irrelevant facts, learning-request selection, normalized preference keys, selection limits, JSON-length boundaries, and preservation of source arrays. TypeScript and whitespace checks passed. The 30-second timeouts and incomplete-response guards were reviewed; live timeout-expiry and incomplete-response failures were not separately injected. Provider checks are not yet a committed automated regression suite. Native audio was unchanged during this milestone; earlier native validation remains a separate checkpoint.
+
+## 15. Milestone 13 Validation Checkpoint
+
+Live tests verified a saved rover-color follow-up after a completed rover request, followed by an unrelated teaching request that respected the learning preference without mentioning the rover. A later “Tell me more about it” continued the promises discussion. Those live answers demonstrate routing and conversational behavior; recent history can also support the model's pronoun interpretation, so they alone do not prove which memory snapshot was selected.
+
+Separate isolated integration checks substituted model/speech calls and a synthetic environment. They verified selection of the last completed user request, inclusion of follow-up facts without inherited teaching preferences, exclusion of the old subject for unrelated requests, behavior without previous history, a single unchanged actual user request, and omission of the memory wrapper from persisted conversational messages. No actual credentials, audio, model requests, or saved user memory were accessed in these checks.
+
+Review exposed a crowded-memory regression: ten earlier facts matching the previous subject could tie a later fact answering the current question and exclude it from the ten slots. Current-match priority resolved it. The repeatable suite now includes that case and checks that inherited-only matches remain below one point without double-counting current words.
+
+Run `npm test` from the project root. It executes `tsx --test src/tests/memory-context.ts` and currently contains **15 passing tests** covering ranking and stable ties, distinct/ignored words, spelling variants, value exclusion, teaching boundaries, context isolation and truncation, ten-fact and exact/over-budget limits, skipping oversized prefixes, JSON escaping, empty selections, and input preservation. Tests use synthetic facts; they do not launch JARVIS, read saved memory or credentials, or make network requests. TypeScript (`npx tsc --noEmit`) and whitespace checks also pass. The isolated conversation integration checks and live provider behavior are separate from this committed test-file scope.
+
+This milestone improves ranked lexical retrieval; it does not introduce embeddings, broad synonym resolution, or multi-turn subject tracking. Existing provider fallback, history persistence, explicit fact commands, and audio behavior remain as documented above.

@@ -19,7 +19,21 @@ export const processMessage = async (
   isSessionCurrent?: () => boolean,
   memoryFacts: MemoryFact[] = [],
 ): Promise<ConversationTurn | null> => {
-  const memoryContext = buildMemoryContext(memoryFacts, userInput);
+  const lastUserMessage = conversationHistory
+    .filter((message) => {
+      return message.role === "user";
+    })
+    .at(-1);
+
+  const previousRequest: string | undefined = lastUserMessage
+    ? lastUserMessage.content
+    : undefined;
+
+  const memoryContext = buildMemoryContext(
+    memoryFacts,
+    userInput,
+    previousRequest,
+  );
 
   const requestMessages: Message[] = [...conversationHistory];
   if (memoryContext) {
