@@ -17,6 +17,7 @@ Its main responsibilities are:
 - Manage listening states, timeouts, and session resets.
 - Coordinate native playback requests, completion events, and shutdown cleanup.
 - Restore bounded conversation context and coordinate persistent-history saves and clearing.
+- Execute explicit long-term memory commands through a separate validated fact store and update queue.
 
 ---
 
@@ -128,7 +129,7 @@ The size calculation uses JavaScript string `.length` (UTF-16 code units), not m
 
 `processMessage()` waits for speech and checks the controller's session-validity callback before appending the user/assistant pair. It returns a `ConversationTurn` for a completed, current-session exchange, or `null` for a rejected, interrupted, or obsolete response. The controller appends non-null turns to `savedHistory.turns` and awaits `queueHistorySave()`.
 
-Local-command responses and history-clear confirmations are not persisted as conversational turns. Conversation history does not automatically extract permanent facts or perform semantic retrieval over older exchanges.
+Local-command responses, memory-command responses, and history-clear confirmations are not persisted as conversational turns. Conversation history does not automatically extract permanent facts or perform semantic retrieval over older exchanges.
 
 ### Save Queue and Session-Only Mode
 
@@ -152,6 +153,59 @@ The two helpers have different responsibilities:
 - `clearConversationHistory()` waits for older queued saves, performs the memory reset, and awaits a save of empty history. It returns whether persistence remains available, allowing the spoken response to distinguish confirmed saved clearing from session-only clearing.
 
 The command branch preserves `lastCommand` as `null` after clearing. In disabled or failed-persistence mode, saved history remains untouched by this operation. Independently created backup files are not cleared.
+
+### Explicit Long-Term Fact Store
+
+Milestone 11 adds a separate store in `data/memory.json`. It is independent of `savedHistory`, `conversationHistory`, and `JARVIS_HISTORY_ENABLED`. Clearing conversation history preserves facts; forgetting a fact does not erase any mentions in conversation history or backup files. The memory path is under the existing Git-ignored `data/` directory.
+
+The file format is:
+
+```json
+{
+  "version": 1,
+  "facts": [
+    { "key": "favorite color", "value": "blue" }
+  ]
+}
+```
+
+This is an example, not a statement about the user's actual preferences. Fact keys and values must be nonempty strings after trimming. Keys are compared after trimming and lowercasing. `isMemoryFile()` rejects duplicate normalized keys; `upsertMemoryFact()` replaces a matching fact or appends a new one without mutating the original array. Values retain their capitalization. Normalization alone does not equate synonyms or British/American spelling variants.
+
+`loadMemoryFile()` reads before VAD/microphone initialization. Missing files produce empty version-1 memory. Other read failures, malformed JSON, unsupported versions, or invalid facts propagate to the controller, which warns and sets `canPersistMemory` to `false`. A rejected file is not overwritten by later remember/forget requests. The active store starts empty if loading fails, so recall/list cannot inspect facts in the rejected file.
+
+### Memory Update Queue
+
+`MemoryUpdate` describes a callback from a facts array to its replacement array. `queueMemoryUpdate()` invokes that callback inside a serialized Promise chain, so it sees the latest committed facts rather than an earlier snapshot. The supplied operations return new arrays instead of modifying active facts in place.
+
+`persistMemoryUpdate()` creates a version-1 candidate and awaits `saveMemoryFile()` before assigning it to `savedMemory`. Saving validates first, creates the destination directory as needed, writes a unique temporary file beside the destination, and renames it into place. Cleanup attempts preserve the original write/rename error.
+
+The queue reports a boolean result. Invalid update input is caught as `false` while leaving later valid updates possible. A disk-save failure preserves active facts, disables persistence for the session, and also returns `false`. A successful result means saving finished and active memory was updated; same-directory replacement is still not a power-loss durability guarantee or a cross-process lock.
+
+### Memory Commands and Classification
+
+`MemoryCommand` is a discriminated union:
+
+| Action | Required data | Controller behavior |
+| ------ | ------------- | ------------------- |
+| `remember` | `fact` containing a key and value | Queue an insert/update and acknowledge only after save success |
+| `recall` | Nonempty `key` | Wait for updates, then return a matching active value or a not-found response |
+| `forget` | Nonempty `key` | Check existence and remove the target inside the update callback; report failure, removal, or no match |
+| `list` | None | Wait for updates, then report all active facts or empty memory |
+
+The classifier accepts local identifiers, `NONE`, or memory-command JSON from the same Ollama request. JSON is parsed as `unknown`, validated with `isMemoryCommand()`, and returned as `{ status: "MEMORY", command }`. Known memory keys are included as data to help the model map wording to existing fact names. Memory values are not supplied to that classifier.
+
+Code-level routing supplements the prompt:
+
+- Complete review phrases route immediately to `list`: “What do you remember about me?”, “What have you saved about me?”, “List my saved facts”, and “Show my saved facts”. Matching trims/lowercases input and removes trailing sentence punctuation.
+- A model-selected `remember` action requires a prefix of `remember`, `save`, `store`, or `update`, optionally preceded by `please`. Ordinary statements do not pass this check.
+- A model-selected `forget` action requires `forget` or `please forget` at the beginning of the input.
+- When the model returns `NONE`, `extractMemoryRecallKey()` supports “What is my…” and “What's my…” questions by extracting the literal normalized suffix as a recall key. The handler decides whether the value exists, even when memory is empty. Recognized local identifiers keep their existing route.
+
+These are limited phrase/structure checks. Model-based extraction and key matching remain fallible, and unsupported polite wording may be rejected. The literal recall fallback does not perform semantic retrieval or synonym resolution. Payload validation verifies shape, not that a model's chosen key/value perfectly represents every utterance.
+
+The controller waits for pending memory updates before classifying with the current keys. Its `MEMORY` branch calls `executeMemoryCommand()`, checks session validity before speaking the result, and clears previous-local-command context. A requested update may already have been saved when its spoken confirmation is interrupted; the session guard suppresses obsolete speech rather than undoing committed memory.
+
+`executeMemoryCommand()` returns text without directly invoking TTS. Recall and list are read-only. The controller speaks the text, and memory exchanges bypass conversational-history saving. Saved facts are not injected into the general `processMessage()` prompt: remembering a learning preference, for example, does not yet automatically change conversational behavior.
 
 ### Listening States
 
@@ -730,3 +784,15 @@ Live tests verified history-file creation and recall after restart; omission of 
 Isolated checks verified serialized saves and snapshot contents, clearing after a pending save, disabling writes after load/save failures, original-file preservation and temporary-file cleanup on rename failure, malformed JSON and schema rejection, and startup/runtime turn and text-size limits. Interrupted and obsolete responses did not modify model context. These checks used temporary fixtures or substituted I/O, without changing the user's saved history.
 
 The final closeout checks also passed TypeScript checking, whitespace checks, native compilation, and all three native offline self-tests. The npm test script remains a placeholder; these isolated history checks are not yet a committed automated test suite.
+
+## 13. Milestone 11 Validation Checkpoint
+
+Live tests verified a remembered fact appearing in `memory.json`, recall and listing after restart, updating without duplicate keys, and targeted forgetting persisting across restart. After a missing-fact question initially fell through to conversational AI, prompt and routing changes were tested and the live missing-fact/time-command regression passed.
+
+Another live test used `JARVIS_HISTORY_ENABLED=false`: a remembered fact survived clearing session conversation history and remained recallable. A backup-protected version-2 memory-file test confirmed that startup warned, refused updates, and preserved the rejected file. The valid version-1 file was restored afterward.
+
+Classification-only Ollama tests exposed inconsistent broad-list routing, hypothetical forgetting, missing-fact routing, and an unwanted remember classification for an ordinary statement. Deterministic list routing, explicit mutation-prefix guards, and the `NONE` recall fallback were added. Simulated model-output checks exercised those paths without executing commands or modifying user files; the examples do not establish universal natural-language classification accuracy.
+
+Isolated checks also covered blank facts, duplicate normalized keys, malformed commands/files, save/reload, normalized lookup/update/removal, update ordering, use of the latest committed facts, save-failure retention, disabled further writes, and temporary-file cleanup. TypeScript and whitespace checks passed at closeout. The memory module and classifier tests are not yet a committed automated test suite.
+
+Automatic fact extraction, automatic use of saved facts in general conversation, and vector/semantic retrieval remain outside this milestone's explicit-command implementation.

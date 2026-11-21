@@ -33,6 +33,16 @@ import {
 import VADBuilder, { VADMode, VADEvent } from "@ozymandiasthegreat/vad";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
+import {
+  findMemoryFact,
+  loadMemoryFile,
+  removeMemoryFact,
+  saveMemoryFile,
+  upsertMemoryFact,
+  type MemoryCommand,
+  type MemoryFact,
+  type MemoryFile,
+} from "../memory/index.js";
 
 export const startVoiceController = async (): Promise<void> => {
   // Loading Conversation History
@@ -81,6 +91,123 @@ export const startVoiceController = async (): Promise<void> => {
     });
 
     return historySaveQueue;
+  };
+
+  // Loading Memory File
+  const memoryFilePath = resolve("data/memory.json");
+  let savedMemory: MemoryFile = { version: 1, facts: [] };
+  let canPersistMemory: boolean = true;
+
+  try {
+    savedMemory = await loadMemoryFile(memoryFilePath);
+  } catch (error) {
+    canPersistMemory = false;
+    console.warn(
+      "Saved memory could not be loaded. Memory updates are disabled for this session.",
+      error,
+    );
+  }
+
+  const persistMemoryUpdate = async (
+    memoryFacts: MemoryFact[],
+  ): Promise<boolean> => {
+    if (!canPersistMemory) return false;
+
+    const snapshot: MemoryFile = { version: 1, facts: [...memoryFacts] };
+
+    try {
+      await saveMemoryFile(memoryFilePath, snapshot);
+
+      savedMemory = snapshot;
+      return true;
+    } catch (error) {
+      canPersistMemory = false;
+      console.warn(
+        "Saved memory could not be updated. The previous memory has been retained; further updates are disabled for this session.",
+        error,
+      );
+
+      return false;
+    }
+  };
+
+  type MemoryUpdate = (facts: MemoryFact[]) => MemoryFact[];
+  let memoryUpdateQueue: Promise<boolean> = Promise.resolve(true);
+
+  const queueMemoryUpdate = async (update: MemoryUpdate): Promise<boolean> => {
+    memoryUpdateQueue = memoryUpdateQueue
+      .then(async () => {
+        if (!canPersistMemory) return false;
+
+        const storedFacts = update(savedMemory.facts);
+
+        return await persistMemoryUpdate(storedFacts);
+      })
+      .catch((error) => {
+        console.warn(
+          "Memory update failed. The previous memory has been retained.",
+          error,
+        );
+
+        return false;
+      });
+
+    return memoryUpdateQueue;
+  };
+
+  const executeMemoryCommand = async (
+    command: MemoryCommand,
+  ): Promise<string> => {
+    if (command.action === "remember") {
+      const response = await queueMemoryUpdate((latestFacts: MemoryFact[]) => {
+        return upsertMemoryFact(latestFacts, command.fact);
+      });
+
+      return response
+        ? "I've saved that to memory, Sir."
+        : "I couldn't save that to memory, Sir.";
+    }
+
+    if (command.action === "recall") {
+      await memoryUpdateQueue;
+
+      const fact = findMemoryFact(savedMemory.facts, command.key);
+      return fact
+        ? `I have ${fact.key} saved as ${fact.value}, Sir.`
+        : "I don't have a saved value for that, Sir.";
+    }
+
+    if (command.action === "forget") {
+      let factWasPresent: boolean = false;
+
+      const response = await queueMemoryUpdate((latestFacts: MemoryFact[]) => {
+        if (findMemoryFact(latestFacts, command.key)) factWasPresent = true;
+
+        return removeMemoryFact(latestFacts, command.key);
+      });
+
+      if (!response) return "I couldn't remove that from saved memory, Sir.";
+
+      if (factWasPresent) return "I've removed that from saved memory, Sir.";
+      else return "I don't have a saved value for that, Sir.";
+    }
+
+    if (command.action === "list") {
+      await memoryUpdateQueue;
+
+      if (savedMemory.facts.length === 0)
+        return "I don't have any saved facts yet, Sir.";
+
+      const sentencedFacts = savedMemory.facts.map((fact) => {
+        return `Your ${fact.key} is ${fact.value}.`;
+      });
+
+      const joinedFacts = sentencedFacts.join(" ");
+
+      return `Here's what I have saved, Sir. ${joinedFacts}`;
+    }
+
+    return "That memory action isn't available yet, Sir.";
   };
 
   // VAD Initialization
@@ -494,14 +621,17 @@ export const startVoiceController = async (): Promise<void> => {
       console.log("Cleaned command:", cleanedTranscription);
 
       const normalizedCommand = cleanedTranscription
-        .toLowerCase()
         .trim()
+        .toLowerCase()
         .replace(/[.!?]+$/, "");
       if (normalizedCommand === "stop") return;
+
+      await memoryUpdateQueue;
 
       const classification = await classifyIntent(
         cleanedTranscription,
         lastCommand,
+        savedMemory.facts.map((fact) => fact.key),
       );
       if (commandSessionId !== sessionId) return;
 
@@ -521,6 +651,20 @@ export const startVoiceController = async (): Promise<void> => {
 
         if (classification.command !== "CLEAR_HISTORY")
           lastCommand = classification.command;
+
+        console.log(`J.A.R.V.I.S.: ${commandResponse}`);
+        await speak(commandResponse);
+      } else if (classification.status === "MEMORY") {
+        state = "SPEAKING";
+        console.log("JARVIS is speaking...");
+
+        const commandResponse = await executeMemoryCommand(
+          classification.command,
+        );
+
+        if (commandSessionId !== sessionId || isShuttingDown) return;
+
+        lastCommand = null;
 
         console.log(`J.A.R.V.I.S.: ${commandResponse}`);
         await speak(commandResponse);

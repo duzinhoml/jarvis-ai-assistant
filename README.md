@@ -28,6 +28,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **macOS Integration:** Open Safari, Chrome, Visual Studio Code, and Finder. Retrieve the current time, date, and battery status.
 - **Music Commands:** Open a configured study playlist in Chrome and pause or resume Apple Music when explicitly named.
 - **Conversation History:** Save completed conversational exchanges locally and restore recent context across restarts, with session-only mode and an explicit history-clearing command.
+- **Explicit Long-Term Memory:** Remember, update, recall, list, and forget named facts in a separate local memory file, with validated commands and serialized updates.
 - **Assistant Personality:** Custom system instructions define JARVIS's conversational behavior.
 - **Error Handling:** Handle model execution failures and other runtime errors.
 
@@ -41,7 +42,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 
 ### Planned
 
-- Long-term memory for selected facts and preferences beyond recent conversation history.
+- Contextual use of saved facts in general conversation, beyond explicit memory commands.
 - Context-aware interactions and improved reasoning.
 - Expanded macOS automation.
 - Hardware integration using Arduino.
@@ -155,11 +156,33 @@ JARVIS_HISTORY_ENABLED=false npx tsx src/main.ts
 
 Only the exact value `false` disables persistence. Session-only mode still remembers exchanges until the process exits, subject to the context limits below.
 
-Say **“Jarvis, clear my conversation history”** to reset current context and attempt to persist empty history. The system prompt is preserved. In session-only mode, or if persistence was disabled after an error, this clears memory without changing saved history; the spoken response distinguishes that outcome from a confirmed full clear. Clearing history does not remove independently created backup copies.
+Say **“Jarvis, clear my conversation history”** to reset current context and attempt to persist empty history. The system prompt is preserved. In session-only mode, or if persistence was disabled after an error, this clears conversational context without changing saved history; the spoken response distinguishes that outcome from a confirmed full clear. Clearing conversation history does not clear the separate long-term fact store or independently created backup copies.
 
 The model receives at most the **10 most recent completed turns**, trimmed further to **6,000 JavaScript string-length units** of historical message text. Complete oldest pairs are removed first. These limits apply at startup and during the session; the saved archive retains all completed turns until explicitly cleared. The system prompt and current request are outside the historical-text budget, which is not a model-token limit.
 
 If a history file is missing, JARVIS starts with empty history. If loading or saving fails, it reports the error and disables persistence for that session. A failed load is not automatically overwritten with empty history.
+
+**Saved facts and preferences**
+
+Explicitly remembered facts are stored separately in `data/memory.json`, also excluded from Git. Each fact has a string key and value. Keys are trimmed and lowercased; remembering the same normalized key updates its value instead of creating a duplicate.
+
+| Action | Example spoken request |
+| ------ | ---------------------- |
+| Remember | “Jarvis, remember that my favorite color is blue.” |
+| Update | “Jarvis, update my favorite color to green.” |
+| Recall | “Jarvis, what is my favorite color?” |
+| Review | “Jarvis, what do you remember about me?” |
+| Forget one fact | “Jarvis, forget my favorite color.” |
+
+Use one action per request. Remember/update requests currently require a prefix of `remember`, `save`, `store`, or `update`, optionally preceded by `please`. Forget requests require `forget` or `please forget`. These code checks filter model-selected write/delete actions; an ordinary statement such as “My favorite color is blue” does not pass the remember guard.
+
+Four complete review phrases route directly to listing without a model request: “What do you remember about me?”, “What have you saved about me?”, “List my saved facts”, and “Show my saved facts”. Matching ignores capitalization and trailing sentence punctuation. If the model returns `NONE`, personal-fact questions beginning “What is my…” or “What's my…” have a literal-key recall fallback, including when memory is empty. Recognized local commands retain their existing route.
+
+Fact storage is independent of `JARVIS_HISTORY_ENABLED=false`. That setting disables conversation-history reads/writes, not explicit memory. Forgetting a fact removes it from `memory.json`; it does not remove copies in conversation history or manual backups. To remove both forms of retained information, use the corresponding fact-forgetting and conversation-history-clearing actions.
+
+A missing memory file starts an empty fact store. Invalid files disable memory updates for that session without overwriting the rejected file. Failed saves retain the previous active facts and disable further writes. Successful memory changes are acknowledged only after saving. Recall/list use the active fact store; startup warnings report when that store could not be loaded.
+
+This milestone supports explicit fact commands. Facts are not automatically extracted from normal conversation or injected into general conversational prompts, so remembering a preference does not yet automatically change JARVIS's behavior. Semantic key matching and payload extraction still depend on the model; the literal recall fallback does not resolve synonyms or spelling variants by itself.
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
@@ -193,7 +216,13 @@ SoX mode retains `afplay` playback. The speech wrapper uses `say` for supported 
 
 ### Intent Classification
 
-Uses a separate Ollama prompt to distinguish conversational messages from approved local commands. Limited previous-command context supports related follow-up requests.
+Uses a separate Ollama prompt to distinguish conversational messages, approved local commands, and structured memory actions. Local commands remain identifiers; memory responses are JSON parsed as `unknown` and checked with `isMemoryCommand()` before routing. Existing memory keys are supplied to help the model reuse fact names. Limited previous-local-command context supports related follow-up requests. Explicit list phrases bypass the model; write/delete guards and a missing-fact recall fallback supplement model classification.
+
+### Explicit Memory
+
+`src/memory/` separates types, validation, key normalization, array operations, and file storage. Version-1 memory files contain a `facts` array. Validators reject blank keys/values and duplicate normalized keys. The controller loads facts before audio startup, serializes changes through `memoryUpdateQueue`, and calculates each update from the latest committed facts. `saveMemoryFile()` validates before filesystem changes, writes a unique same-directory temporary file, and renames it over the destination. Active memory changes only after the save succeeds.
+
+Recall and listing wait for pending updates and do not save. Forgetting removes only the targeted normalized key. Memory command exchanges use their own controller branch and are not appended to the conversation-history archive. As with history storage, file replacement does not coordinate multiple independent JARVIS processes or guarantee durability through power loss.
 
 ### System Integration
 
@@ -217,7 +246,8 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Integrate native VoiceProcessingIO capture and Kokoro playback, with PCM streaming and a manual SoX fallback.
 - [ ] Improve wake-word reliability, failure recovery, and shutdown handling.
 - [ ] Improve conversational voice interaction.
-- [ ] Extend conversation history with long-term memory for selected facts and preferences.
+- [x] Add a separate explicit fact store with remember, update, recall, review, and targeted forgetting.
+- [ ] Use selected saved facts as context in general conversation.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
 
@@ -244,6 +274,7 @@ JARVIS is designed primarily for local execution.
 - Whisper transcription and default Kokoro speech synthesis run locally after model downloads.
 - The optional ElevenLabs integration sends text to an external service when enabled.
 - Sensitive configuration files and credentials should not be committed.
+- Saved history and facts remain local JSON files under Git-ignored `data/`; Git exclusion does not encrypt them.
 - Microphone recordings and generated audio should remain excluded from version control unless explicitly intended as test assets.
 - Operating-system commands should be validated before execution.
 - Future automation capabilities should use explicit permissions and appropriate safety checks.
@@ -254,7 +285,9 @@ JARVIS is designed primarily for local execution.
 
 Milestone 9 native audio validation includes intelligible streamed audio, Whisper transcription, repeated wake-word interruption, silent-listening trials without reported self-activation, fallback operation, shutdown during speech, unexpected helper-exit cleanup, and acknowledged playback-timeout recovery. Missing STOP acknowledgement and forced termination were checked with simulated timers; echo suppression has not yet been quantitatively measured for production Kokoro playback.
 
-Milestone 10 history validation includes recall after restart, omission of interrupted exchanges and local commands, preservation of rejected history files, session-only operation without changing the saved file, and live session/persistent clearing. Isolated checks cover queued save ordering, snapshots, save-failure handling, atomic replacement cleanup, schema validation, and startup/runtime context limits. TypeScript and native audio self-tests pass. This is conversation-history persistence; automatic extraction or retrieval of long-term facts is not implemented.
+Milestone 10 history validation includes recall after restart, omission of interrupted exchanges and local commands, preservation of rejected history files, session-only operation without changing the saved file, and live session/persistent clearing. Isolated checks cover queued save ordering, snapshots, save-failure handling, atomic replacement cleanup, schema validation, and startup/runtime context limits. TypeScript and native audio self-tests passed at closeout. That milestone established conversation-history persistence rather than a separate fact store.
+
+Milestone 11 adds explicit fact storage. Live tests verified remembering, recall after restart, listing, update without duplication, persistent forgetting, missing-fact responses, independence from conversation-history clearing, and refusal to overwrite an unsupported memory-file version. Isolated checks cover validation, command guards, parsing, queued updates, persistence failure, and temporary-file cleanup. The small model produced inconsistent list and missing-fact classifications during development; the documented code-level shortcuts, guards, and recall fallback were added in response. Arbitrary wording and semantic key matching remain model-dependent. TypeScript and whitespace checks pass; isolated memory checks are not yet a committed automated test suite.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 
