@@ -19,6 +19,7 @@ Its main responsibilities are:
 - Restore bounded conversation context and coordinate persistent-history saves and clearing.
 - Execute explicit long-term memory commands through a separate validated fact store and update queue.
 - Supply bounded relevant facts to conversational requests and coordinate OpenAI-first routing with local Ollama fallback.
+- Cancel obsolete primary/fallback requests while retaining session guards and distinguishing cancellation from recoverable provider failures.
 
 ---
 
@@ -236,7 +237,7 @@ Both classification and conversation use `gpt-6.1-terra` through the OpenAI Resp
 
 Each client has a **30,000 ms timeout** and **`maxRetries: 0`**. The provider-selection catch permits fallback only for SDK connection errors (including timeouts), HTTP **429**, or HTTP **5xx**. Other errors produce fixed diagnostics. Responses must report `status === "completed"` before their text is used; incomplete responses do not trigger fallback. Conversational whitespace-only output is rejected before speech or history.
 
-Local fallback uses `qwen3:1.7b` at `http://localhost:11434`: classification POSTs to `/api/generate`, while conversation POSTs to `/api/chat` with the same request messages and temperature zero. Both use `AbortSignal.timeout(30000)`. Conversation checks the HTTP result and `data?.message?.content` before using text. Classification retains its allowlist, memory validators, and explicit-intent guards regardless of provider. A failed classifier returns `ERROR`; the controller does not execute an action from failed classification.
+Local fallback uses `qwen3:1.7b` at `http://localhost:11434`: classification POSTs to `/api/generate`, while conversation POSTs to `/api/chat` with the same request messages and temperature zero. Both create `AbortSignal.timeout(30000)` and combine it with the optional caller signal using `AbortSignal.any`; without a caller signal, only the timeout is used. Conversation checks the HTTP result and `data?.message?.content` before using text. Classification retains its allowlist, memory validators, and explicit-intent guards regardless of provider. A failed classifier returns `ERROR`; intentional cancellation instead returns `CANCELLED`. Neither result executes a command.
 
 Fallback warnings distinguish the two stages:
 
@@ -245,7 +246,19 @@ Fallback warnings distinguish the two stages:
 
 Ollama can be stopped during successful primary requests. It must be available for fallback. A classification fallback does not imply conversation fallback, and there is no offline-only provider switch. Authentication or client-configuration failures are not hidden by local fallback.
 
-The controller checks its session after classification. Conversation skips starting fallback if its session is already obsolete and uses the existing pre-speech/post-speech guards. These checks discard stale results; they do not generally abort in-flight provider requests. Classification and conversation, and each stage's primary/fallback attempts, have separate timeouts rather than one end-to-end deadline. The local model's learning-preference adherence remains weaker than the tested primary model.
+The controller checks its session after classification and exits on `CANCELLED`. Conversation skips starting fallback if its session is obsolete or its caller signal is aborted. Milestone 14 adds active request cancellation alongside the existing session guards, as described below. Classification and conversation, and each stage's primary/fallback attempts, have separate timeouts rather than one end-to-end deadline. The local model's learning-preference adherence remains weaker than the tested primary model.
+
+### Per-Command Cancellation and Ownership
+
+The controller holds `activeRequestController: AbortController | null`. `processCommand()` aborts any previous controller, creates a local `requestController`, assigns it as active, and passes its signal to `classifyIntent()` (fourth argument) and `processMessage()` (sixth argument). Both parameters are optional for callers without cancellation. OpenAI receives the signal in the second, request-options argument to `responses.create`, not in the model input.
+
+`abortActiveRequest()` aborts and clears the active reference. It runs immediately after session invalidation during speech barge-in, `resetListeningSession()`, and shutdown. Playback still stops separately through `stopKokoroPlayback()`. A command's `finally` clears the shared reference only if `activeRequestController === requestController`; an older command cannot clear a newer controller. Temporary-file cleanup still runs, and the existing session/shutdown checks prevent stale cleanup from resetting a newer listening session.
+
+Intentional cancellation is identified by the caller's `signal?.aborted`, not merely an error name. An SDK timeout with a live caller signal can still trigger fallback. A local timeout with a live caller signal remains a real error: classification returns `ERROR`, while conversation throws the fixed message `Local conversation fallback failed or timed out.` The controller can speak recovery feedback for genuine failures but suppresses it when shutdown, session invalidation, or this command's aborted signal makes the error obsolete.
+
+Both functions reject already-cancelled work before constructing clients; classification checks before its explicit-list shortcut. Classifier catches return `CANCELLED` before logging or fallback. Additional checks after local fetch and JSON parsing prevent a late HTTP failure or malformed payload from being reported as `ERROR` after cancellation. A final check precedes routing. Conversation catches return `null` for caller cancellation, including during fallback/body reading. It checks again before output validation/speech and after speech before committing history. Cancelled late results do not become spoken answers or saved exchanges. The empty-response guard remains outside both provider branches.
+
+Microphone data remains ignored during `PROCESSING`. This milestone does not introduce wake-word detection while awaiting model output. It also does not cancel transcription, undo already-executed OS actions or committed memory changes, or guarantee remote server computation stops after the local HTTP request is aborted.
 
 ### Listening States
 
@@ -406,6 +419,7 @@ If STOP is not acknowledged within **2,000 ms**, or sending that timeout STOP fa
 ```ts
 const resetListeningSession = (): void => {
   sessionId++;
+  abortActiveRequest();
   resetAudioBuffers(buffers);
   commandBytes = 0;
   totalBytes = 0;
@@ -420,7 +434,7 @@ const resetListeningSession = (): void => {
 };
 ```
 
-Centralizes cleanup across timeouts and completed command executions. It increments `sessionId`, empties rolling audio buffers, resets byte counters and VAD flags, transitions the state back to `IDLE`, and activates the speech cooldown.
+Centralizes cleanup across timeouts and completed command executions. It increments `sessionId`, aborts/clears any active request controller, empties rolling audio buffers, resets byte counters and VAD flags, transitions the state back to `IDLE`, and activates the speech cooldown.
 
 ---
 
@@ -699,6 +713,7 @@ if (
 ) {
   if (state === "SPEAKING") {
     sessionId++;
+    abortActiveRequest();
     stopKokoroPlayback();
     buffers.command.length = 0;
     commandBytes = 0;
@@ -717,7 +732,7 @@ if (
 
 When the wake word is confirmed while `state === "SPEAKING"`:
 
-1. **`sessionId++`**: Invalidates the prior session so that in-flight asynchronous operations or error handlers from that command cycle are disregarded.
+1. **`sessionId++` and `abortActiveRequest()`**: Invalidate the prior session and cancel its active provider requests; stale asynchronous results remain guarded by session checks.
 2. **`stopKokoroPlayback()`**: Increments Kokoro's separate `speechSession` counter so older speech cannot advance to another chunk. In native mode it sends STOP for pending playback IDs; in SoX mode it interrupts the active `afplay` process with `SIGTERM`.
 3. **Buffer reset**: Discards prior command audio and seeds the new command buffer with the captured wake-word audio and any pending chunks.
 4. **Immediate listening**: Switches `state = "LISTENING"` and records the user's new request without requiring an idle transition or cooldown.
@@ -727,14 +742,23 @@ When the wake word is confirmed while `state === "SPEAKING"`:
 ```ts
 const processCommand = async (): Promise<void> => {
   const commandSessionId = sessionId;
+  activeRequestController?.abort();
+  const requestController = new AbortController();
+  activeRequestController = requestController;
 
   try {
     // ... execute command and speak response
   } catch (error) {
-    if (!isShuttingDown && commandSessionId === sessionId) {
+    if (
+      !isShuttingDown &&
+      commandSessionId === sessionId &&
+      !requestController.signal.aborted
+    ) {
       // Speak error response
     }
   } finally {
+    if (activeRequestController === requestController)
+      activeRequestController = null;
     // Clean up temporary audio files
     if (!isShuttingDown && commandSessionId === sessionId) {
       resetListeningSession();
@@ -793,7 +817,7 @@ Playback has its own two-minute timeout and two-second STOP acknowledgement limi
 
 `shutdownVoiceController()` is shared by SIGINT, SIGTERM, child-process errors, and unexpected child closure. Its shutdown flag prevents duplicate cleanup.
 
-It marks shutdown active, increments the controller session, clears wake-word polling, and stops the Kokoro speech session before rejecting pending native playback. That order prevents late playback errors from reviving an obsolete response. It clears native playback configuration, requests child termination if needed, destroys VAD, and requests Kokoro worker shutdown.
+It marks shutdown active, increments the controller session, aborts/clears the active request controller, clears wake-word polling, and stops the Kokoro speech session before rejecting pending native playback. That order prevents late provider or playback results from reviving an obsolete response. It clears native playback configuration, requests child termination if needed, destroys VAD, and requests Kokoro worker shutdown.
 
 Kokoro's graceful worker shutdown has a ten-second timeout; if it expires, shutdown requests forced worker termination and waits for completion. Startup failure in `src/main.ts` also requests worker shutdown, covering a failure before controller cleanup handlers have been registered.
 
@@ -857,6 +881,18 @@ Separate isolated integration checks substituted model/speech calls and a synthe
 
 Review exposed a crowded-memory regression: ten earlier facts matching the previous subject could tie a later fact answering the current question and exclude it from the ten slots. Current-match priority resolved it. The repeatable suite now includes that case and checks that inherited-only matches remain below one point without double-counting current words.
 
-Run `npm test` from the project root. It executes `tsx --test src/tests/memory-context.ts` and currently contains **15 passing tests** covering ranking and stable ties, distinct/ignored words, spelling variants, value exclusion, teaching boundaries, context isolation and truncation, ten-fact and exact/over-budget limits, skipping oversized prefixes, JSON escaping, empty selections, and input preservation. Tests use synthetic facts; they do not launch JARVIS, read saved memory or credentials, or make network requests. TypeScript (`npx tsc --noEmit`) and whitespace checks also pass. The isolated conversation integration checks and live provider behavior are separate from this committed test-file scope.
+At the Milestone 13 checkpoint, `npm test` ran `tsx --test src/tests/memory-context.ts` with **15 passing tests** covering ranking and stable ties, distinct/ignored words, spelling variants, value exclusion, teaching boundaries, context isolation and truncation, ten-fact and exact/over-budget limits, skipping oversized prefixes, JSON escaping, empty selections, and input preservation. Those tests use synthetic facts without launching JARVIS, reading saved memory or credentials, or making network requests. Milestone 14 expands the test script as described below. The isolated conversation integration checks and live provider behavior are separate from the retrieval test-file scope.
 
 This milestone improves ranked lexical retrieval; it does not introduce embeddings, broad synonym resolution, or multi-turn subject tracking. Existing provider fallback, history persistence, explicit fact commands, and audio behavior remain as documented above.
+
+## 16. Milestone 14 Validation Checkpoint
+
+`npm test` now executes `tsx --test src/tests/*.ts`: **36 tests pass**, comprising the 15 retrieval cases and 21 cancellation/recovery cases in `request-cancellation.ts`. The helper under `src/tests/helpers/request-harness.ts` evaluates the real provider functions with substituted OpenAI, fetch, speech, timeout signals, and a synthetic environment. It uses the installed esbuild transform and a VM context; the real OpenAI/TTS modules are not loaded by that harness. No saved user data, real credential values, audio, or external requests are used.
+
+For both classification and conversation, the suite verifies pre-aborted entry, cancellation during primary requests, late successful primary replies, cancellation during fallback fetch/body reads, and late fallback replies. It also checks that primary timeouts still allow local recovery, local timeouts remain errors rather than caller cancellation, API-access errors do not trigger fallback, and a later independent request succeeds after timeout. Conversation cancellation during speech does not append history.
+
+Two additional race tests initially failed: classification logged and returned `ERROR` for a late local HTTP failure or invalid body even though the caller had cancelled. Checks immediately after fetch and body parsing fixed both; these cases now return `CANCELLED` without error logging. Timeout tests manually trigger synthetic timeout controllers rather than waiting 30 seconds or using a stalled server. They validate the distinction and configured duration, not actual remote timing behavior.
+
+Live shutdown during processing completed with worker and microphone cleanup and no late response, fallback warning, or command-processing error. A separate live speech-interruption check stopped the explanation, answered a new time request, and returned to readiness without resuming the old response. The source-level ownership and session cleanup paths were reviewed; the isolated test harness does not instantiate the complete voice controller or exercise real network cancellation.
+
+TypeScript and whitespace checks pass. New commands during `PROCESSING`, transcription cancellation, and remote-server cancellation guarantees remain outside this milestone. Existing speech interruption and session validity checks remain in place alongside HTTP cancellation.

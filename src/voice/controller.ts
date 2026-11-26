@@ -420,6 +420,11 @@ export const startVoiceController = async (): Promise<void> => {
   let cooldownUntil = 0;
 
   let sessionId = 0;
+  let activeRequestController: AbortController | null = null;
+  const abortActiveRequest = (): void => {
+    activeRequestController?.abort();
+    activeRequestController = null;
+  };
 
   let vadSilentFrames = 0;
   let vadVoiceDetected = false;
@@ -559,6 +564,7 @@ export const startVoiceController = async (): Promise<void> => {
       ) {
         if (state === "SPEAKING") {
           sessionId++;
+          abortActiveRequest();
           stopKokoroPlayback();
           buffers.command.length = 0;
           commandBytes = 0;
@@ -590,6 +596,7 @@ export const startVoiceController = async (): Promise<void> => {
 
   const resetListeningSession = (): void => {
     sessionId++;
+    abortActiveRequest();
     resetAudioBuffers(buffers);
     commandBytes = 0;
     totalBytes = 0;
@@ -606,6 +613,10 @@ export const startVoiceController = async (): Promise<void> => {
   const processCommand = async (): Promise<void> => {
     const commandSessionId = sessionId;
     const commandFile = `command-${commandSessionId}.wav`;
+
+    activeRequestController?.abort();
+    const requestController = new AbortController();
+    activeRequestController = requestController;
 
     try {
       const pcmBuffer = Buffer.concat(buffers.command);
@@ -632,8 +643,10 @@ export const startVoiceController = async (): Promise<void> => {
         cleanedTranscription,
         lastCommand,
         savedMemory.facts.map((fact) => fact.key),
+        requestController.signal,
       );
       if (commandSessionId !== sessionId) return;
+      if (classification.status === "CANCELLED") return;
 
       if (classification.status === "COMMAND") {
         state = "SPEAKING";
@@ -685,6 +698,7 @@ export const startVoiceController = async (): Promise<void> => {
             return commandSessionId === sessionId && !isShuttingDown;
           },
           [...savedMemory.facts],
+          requestController.signal,
         );
 
         if (completedTurn !== null) {
@@ -700,7 +714,11 @@ export const startVoiceController = async (): Promise<void> => {
         await speak(errorResponse);
       }
     } catch (error) {
-      if (!isShuttingDown && commandSessionId === sessionId) {
+      if (
+        !isShuttingDown &&
+        commandSessionId === sessionId &&
+        !requestController.signal.aborted
+      ) {
         console.error("JARVIS command processing failed:", error);
         try {
           state = "SPEAKING";
@@ -712,6 +730,9 @@ export const startVoiceController = async (): Promise<void> => {
         }
       }
     } finally {
+      if (activeRequestController === requestController)
+        activeRequestController = null;
+
       try {
         await unlink(commandFile);
       } catch (error) {
@@ -728,6 +749,7 @@ export const startVoiceController = async (): Promise<void> => {
     if (isShuttingDown) return;
     isShuttingDown = true;
     sessionId++;
+    abortActiveRequest();
 
     clearInterval(wakeInterval);
     stopKokoroPlayback();

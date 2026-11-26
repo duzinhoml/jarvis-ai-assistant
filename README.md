@@ -21,6 +21,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Terminal Feedback:** Display listening states, transcriptions, responses, and errors in the terminal.
 - **Text-to-Speech:** Generate spoken responses locally using Kokoro in a worker thread, with chunked playback through native VoiceProcessingIO. SoX mode uses macOS `afplay`; supported speech failures fall back to `say`.
 - **Speech Interruption:** Detect the wake word during Kokoro speech to interrupt playback and begin a new request.
+- **Request Cancellation:** Share a per-command abort signal across primary and fallback model requests, cancelling obsolete work on session invalidation or shutdown without cancellation error speech.
 - **Speech Recording:** Capture microphone input through native VoiceProcessingIO and stream 16 kHz mono Int16 PCM to TypeScript, with SoX available as a manual fallback.
 - **Speech Recognition:** Transcribe recorded audio using Whisper.
 - **Voice Activity Detection (VAD):** Detect speech and silence with WebRTC VAD and use listening timeouts to process requests.
@@ -200,7 +201,7 @@ The selected snapshot is wrapped as untrusted reference data in a request-only m
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
-To check types without compiling, run `npx tsc --noEmit`. Run `npm test` for the 15 isolated memory-retrieval regression tests in `src/tests/memory-context.ts`; these use synthetic facts without reading saved memory, loading credentials, starting audio, or making model requests. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
+To check types without compiling, run `npx tsc --noEmit`. Run `npm test` for **36 isolated regression tests**: 15 memory-retrieval cases in `src/tests/memory-context.ts` and 21 cancellation/recovery cases in `src/tests/request-cancellation.ts`. The script runs `tsx --test src/tests/*.ts`; helpers are under `src/tests/helpers/`. These tests use synthetic data and substituted providers without reading saved memory, loading real credentials, starting audio, or making model requests. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
 
 ```bash
 swift native/audio/main.swift --test-streaming-buffer
@@ -218,7 +219,11 @@ Processes natural-language input, manages recent conversational context, and gen
 
 Both OpenAI clients use a 30-second timeout with SDK retries disabled. Connection errors (including timeouts), HTTP 429, and HTTP 5xx permit Ollama fallback. Authentication/configuration errors, incomplete OpenAI responses, and empty conversational output do not trigger fallback. OpenAI responses must have status `completed`. Local fallback requests also have 30-second abort signals; classification uses `/api/generate`, and conversation uses `/api/chat`. Classification and conversation are separate stages, so their timeouts can accumulate. These are not a single end-to-end deadline.
 
-An obsolete conversation skips starting fallback after an OpenAI failure; existing session guards suppress stale speech/history. In-flight provider requests are not generally cancelled on barge-in. Fallback warnings identify whether classification or response generation switched providers. The local model remains less reliable at following learning preferences than the primary model.
+Each command owns an `AbortController`, and both model stages receive its signal. Starting a replacement command aborts the previous controller. Wake-word interruption during speech, session reset, and shutdown abort and clear the active controller. Primary requests receive the signal through SDK request options; local fetches combine it with their timeout using `AbortSignal.any`. The caller's aborted signal means intentional cancellation, while a provider-only timeout still follows normal fallback/error recovery.
+
+Cancelled classification returns `CANCELLED` without executing a command. Cancelled conversation returns `null` without speaking a late answer or saving the exchange. Checks cover entry, provider errors, successful late results, and post-speech history updates. The controller retains session guards and clears its active-controller reference only when the finishing command still owns it. Fallback warnings identify whether classification or response generation switched providers. The local model remains less reliable at following learning preferences than the primary model.
+
+New microphone input is still ignored during `PROCESSING`; wake-word interruption is available during speech, not while waiting for a model. Request cancellation does not cancel Whisper transcription, undo completed commands or memory writes, or guarantee that a remote server stops computation. Kokoro playback is stopped separately from network cancellation.
 
 History saves run through a serialized Promise queue using snapshots. Each save writes a unique temporary file beside the destination and renames it into place; failed writes or renames attempt temporary-file cleanup while preserving the original error. This prevents partial-file replacement during normal operation. It does not provide coordination between multiple concurrently running JARVIS instances or guaranteed durability through a power failure.
 
@@ -268,6 +273,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Use selected saved facts as bounded context in general conversation.
 - [x] Rank memory by current-request relevance, pack the context budget, normalize spelling aliases, and support bounded follow-ups with regression tests.
 - [x] Add OpenAI classification and conversation with validated routing and local Ollama fallback.
+- [x] Cancel obsolete primary/fallback model requests and distinguish intentional cancellation from timeout/error recovery.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
 
@@ -314,6 +320,8 @@ Milestone 11 adds explicit fact storage. Live tests verified remembering, recall
 Milestone 12 adds bounded, request-specific memory context and OpenAI primary classification/conversation with local fallback. User-run tests verified relevant personalization, saved learning-preference use and an explicit solution override, updated and forgotten facts across restarts, preservation of other facts, and interruption. Both primary paths worked with Ollama stopped. Separate injected connection failures exercised classification and conversation fallback; the injections and diagnostic prompt were removed. A saved instruction-attempt phrase was discussed as data without changing identity in the tested case. TypeScript and whitespace checks passed. Local fallback still has weaker instruction following; keyword retrieval and prompt boundaries are not general semantic or security guarantees. Timeout and incomplete-response guards were reviewed, but live timeout-expiry and incomplete-response failure cases were not separately exercised.
 
 Milestone 13 improves retrieval with current-request-first scoring, stable ties, skip-and-continue budget packing, spelling aliases, broader teaching cues, and limited previous-request context. Live trials verified a rover-color follow-up, a switch to teaching promises without rover references, and conversational continuity on a later promises follow-up. Isolated integration checks separately verified the request-only memory snapshot. A crowded-memory edge case initially excluded the answer behind ten old-subject matches; revised scoring fixes it and has a regression test. All 15 `npm test` cases, TypeScript, and whitespace checks pass. General semantic retrieval and multi-turn subject tracking remain future work.
+
+Milestone 14 adds per-command request cancellation, ownership-safe cleanup, quiet cancelled results, and combined fallback timeout/cancellation signals. Live checks passed shutdown during processing without a late answer or error, and speech interruption followed by a new time command. All 36 tests, TypeScript, and whitespace checks pass. Simulated cancellation tests cover both providers, late replies, body reads, speech/history protection, timeouts, and recovery on a later request. Two late classification-fallback error races were reproduced and fixed. Full voice-controller lifecycle behavior was reviewed and exercised live, rather than covered by the isolated provider test harness.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 

@@ -18,7 +18,10 @@ export const processMessage = async (
   onSpeaking?: () => boolean,
   isSessionCurrent?: () => boolean,
   memoryFacts: MemoryFact[] = [],
+  signal?: AbortSignal,
 ): Promise<ConversationTurn | null> => {
+  if (signal?.aborted) return null;
+
   const lastUserMessage = conversationHistory
     .filter((message) => {
       return message.role === "user";
@@ -61,17 +64,22 @@ export const processMessage = async (
       maxRetries: 0,
     });
 
-    const response = await openai.responses.create({
-      model: "gpt-6.1-terra",
-      input: requestMessages,
-      store: false,
-    });
+    const response = await openai.responses.create(
+      {
+        model: "gpt-6.1-terra",
+        input: requestMessages,
+        store: false,
+      },
+      { signal },
+    );
 
     if (response.status !== "completed")
       throw new Error("OpenAI did not complete the request.");
 
     responseText = response.output_text;
   } catch (error) {
+    if (signal?.aborted) return null;
+
     if (isSessionCurrent?.() === false) return null;
 
     const canFallback: boolean =
@@ -93,28 +101,41 @@ export const processMessage = async (
       "OpenAI is temporarily unavailable. Using local Ollama fallback.",
     );
 
-    const response = await fetch("http://localhost:11434/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "qwen3:1.7b",
-        messages: requestMessages,
-        options: { temperature: 0 },
-        stream: false,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
+    try {
+      const timeoutSignal = AbortSignal.timeout(30000);
+      const fallbackSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
 
-    if (!response.ok) throw new Error("Local conversation fallback failed.");
+      const response = await fetch("http://localhost:11434/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "qwen3:1.7b",
+          messages: requestMessages,
+          options: { temperature: 0 },
+          stream: false,
+        }),
+        signal: fallbackSignal,
+      });
 
-    const data = await response.json();
-    if (typeof data?.message?.content !== "string")
-      throw new Error("Local conversation fallback returned invalid data.");
+      if (!response.ok) throw new Error("Local conversation fallback failed.");
 
-    responseText = data.message.content;
+      const data = await response.json();
+      if (typeof data?.message?.content !== "string")
+        throw new Error("Local conversation fallback returned invalid data.");
+
+      responseText = data.message.content;
+    } catch (error) {
+      if (signal?.aborted) return null;
+
+      throw new Error("Local conversation fallback failed or timed out.");
+    }
   }
+
+  if (signal?.aborted) return null;
 
   if (!responseText.trim().length)
     throw new Error(
@@ -126,7 +147,8 @@ export const processMessage = async (
   console.log(`J.A.R.V.I.S.: ${responseText}`);
   const speechResult = await speak(responseText);
 
-  if (!speechResult || isSessionCurrent?.() === false) return null;
+  if (!speechResult || isSessionCurrent?.() === false || signal?.aborted)
+    return null;
 
   conversationHistory.push({
     role: "user",

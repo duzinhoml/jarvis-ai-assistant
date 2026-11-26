@@ -6,7 +6,8 @@ export type ClassificationResult =
   | { status: "COMMAND"; command: LocalCommand }
   | { status: "MEMORY"; command: MemoryCommand }
   | { status: "NONE" }
-  | { status: "ERROR" };
+  | { status: "ERROR" }
+  | { status: "CANCELLED" };
 
 const applicationCommands: LocalCommand[] = [
   "OPEN_SAFARI",
@@ -99,7 +100,10 @@ export const classifyIntent = async (
   input: string,
   lastCommand: LocalCommand | null,
   knownMemoryKeys: string[] = [],
+  signal?: AbortSignal,
 ): Promise<ClassificationResult> => {
+  if (signal?.aborted) return { status: "CANCELLED" };
+
   if (hasExplicitMemoryListRequest(input))
     return { status: "MEMORY", command: { action: "list" } };
 
@@ -583,17 +587,22 @@ export const classifyIntent = async (
         maxRetries: 0,
       });
 
-      const response = await client.responses.create({
-        model: "gpt-6.1-terra",
-        input: classificationPrompt,
-        store: false,
-      });
+      const response = await client.responses.create(
+        {
+          model: "gpt-6.1-terra",
+          input: classificationPrompt,
+          store: false,
+        },
+        { signal },
+      );
 
       if (response.status !== "completed")
         throw new Error("OpenAI did not complete the request.");
 
       classificationText = response.output_text;
     } catch (error) {
+      if (signal?.aborted) return { status: "CANCELLED" };
+
       const canFallback: boolean =
         error instanceof OpenAI.APIConnectionError ||
         (error instanceof OpenAI.APIError &&
@@ -609,6 +618,11 @@ export const classifyIntent = async (
         "OpenAI classification is temporarily unavailable. Using local Ollama fallback.",
       );
 
+      const timeoutSignal = AbortSignal.timeout(30000);
+      const fallbackSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
+
       const response = await fetch("http://localhost:11434/api/generate", {
         method: "POST",
         headers: {
@@ -619,8 +633,10 @@ export const classifyIntent = async (
           prompt: classificationPrompt,
           stream: false,
         }),
-        signal: AbortSignal.timeout(30000),
+        signal: fallbackSignal,
       });
+
+      if (signal?.aborted) return { status: "CANCELLED" };
 
       if (!response.ok) {
         console.error("Error occured:", response.status);
@@ -628,6 +644,9 @@ export const classifyIntent = async (
       }
 
       const data = await response.json();
+
+      if (signal?.aborted) return { status: "CANCELLED" };
+
       if (typeof data.response !== "string") {
         console.error("Invalid data type.");
         return { status: "ERROR" };
@@ -635,6 +654,8 @@ export const classifyIntent = async (
 
       classificationText = data.response;
     }
+
+    if (signal?.aborted) return { status: "CANCELLED" };
 
     const aiOutput = classificationText.trim();
     if (aiOutput === "NONE") {
@@ -673,6 +694,8 @@ export const classifyIntent = async (
 
     return { status: "ERROR" };
   } catch (error) {
+    if (signal?.aborted) return { status: "CANCELLED" };
+
     console.error("Intent classification failed. No command was executed.");
     return { status: "ERROR" };
   }

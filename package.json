@@ -4,7 +4,7 @@
   "main": "src/main.ts",
   "type": "module",
   "scripts": {
-    "test": "tsx --test src/tests/memory-context.ts"
+    "test": "tsx --test src/tests/*.ts"
   },
   "keywords": [],
   "author": "",
