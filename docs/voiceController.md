@@ -67,10 +67,10 @@ JARVIS_AUDIO_SOURCE=sox npx tsx src/main.ts
 
 ### Native Process Communication
 
-| Stream | Contents |
-| ------ | -------- |
-| stdin | Newline-delimited JSON playback commands from TypeScript |
-| stdout | Raw microphone PCM only |
+| Stream | Contents                                                   |
+| ------ | ---------------------------------------------------------- |
+| stdin  | Newline-delimited JSON playback commands from TypeScript   |
+| stdout | Raw microphone PCM only                                    |
 | stderr | Diagnostic text and newline-delimited JSON playback events |
 
 Commands use IDs to associate each response with its waiting playback request:
@@ -116,9 +116,9 @@ The controller loads `data/conversation-history.json` before VAD initialization 
 
 Two arrays serve different purposes:
 
-| Value | Purpose |
-| ----- | ------- |
-| `savedHistory.turns` | Full archive of completed exchanges loaded or collected this session |
+| Value                 | Purpose                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------ |
+| `savedHistory.turns`  | Full archive of completed exchanges loaded or collected this session                       |
 | `conversationHistory` | Current system prompt plus bounded recent messages supplied to the conversational provider |
 
 `MAX_CONTEXT_TURNS` is **10**, and `MAX_CONTEXT_CHARACTERS` is **6,000**. Startup selection copies the newest ten turns and removes complete oldest turns until their combined user/assistant text fits the size budget. After each completed response, `processMessage()` applies the equivalent limits to the running message array while preserving the system message at index 0. A single oversized pair is omitted from future model context but remains available for persistence.
@@ -165,9 +165,7 @@ The file format is:
 ```json
 {
   "version": 1,
-  "facts": [
-    { "key": "favorite color", "value": "blue" }
-  ]
+  "facts": [{ "key": "favorite color", "value": "blue" }]
 }
 ```
 
@@ -187,12 +185,12 @@ The queue reports a boolean result. Invalid update input is caught as `false` wh
 
 `MemoryCommand` is a discriminated union:
 
-| Action | Required data | Controller behavior |
-| ------ | ------------- | ------------------- |
-| `remember` | `fact` containing a key and value | Queue an insert/update and acknowledge only after save success |
-| `recall` | Nonempty `key` | Wait for updates, then return a matching active value or a not-found response |
-| `forget` | Nonempty `key` | Check existence and remove the target inside the update callback; report failure, removal, or no match |
-| `list` | None | Wait for updates, then report all active facts or empty memory |
+| Action     | Required data                     | Controller behavior                                                                                    |
+| ---------- | --------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `remember` | `fact` containing a key and value | Queue an insert/update and acknowledge only after save success                                         |
+| `recall`   | Nonempty `key`                    | Wait for updates, then return a matching active value or a not-found response                          |
+| `forget`   | Nonempty `key`                    | Check existence and remove the target inside the update callback; report failure, removal, or no match |
+| `list`     | None                              | Wait for updates, then report all active facts or empty memory                                         |
 
 The classifier accepts local identifiers, `NONE`, or memory-command JSON from an OpenAI Responses API request, with Ollama fallback for supported temporary failures. JSON is parsed as `unknown`, validated with `isMemoryCommand()`, and returned as `{ status: "MEMORY", command }`. Output is plain text checked at runtime, not API-enforced structured output. Known memory keys are included as data to help the model map wording to existing fact names. Memory values are not supplied to that classifier.
 
@@ -258,7 +256,7 @@ Intentional cancellation is identified by the caller's `signal?.aborted`, not me
 
 Both functions reject already-cancelled work before constructing clients; classification checks before its explicit-list shortcut. Classifier catches return `CANCELLED` before logging or fallback. Additional checks after local fetch and JSON parsing prevent a late HTTP failure or malformed payload from being reported as `ERROR` after cancellation. A final check precedes routing. Conversation catches return `null` for caller cancellation, including during fallback/body reading. It checks again before output validation/speech and after speech before committing history. Cancelled late results do not become spoken answers or saved exchanges. The empty-response guard remains outside both provider branches.
 
-Microphone data remains ignored during `PROCESSING`. This milestone does not introduce wake-word detection while awaiting model output. It also does not cancel transcription, undo already-executed OS actions or committed memory changes, or guarantee remote server computation stops after the local HTTP request is aborted.
+Milestone 15 extends wake-word monitoring into `PROCESSING`, allowing stop/replacement recognition while awaiting model output. It does not cancel transcription, undo already-executed OS actions or committed memory changes, or guarantee remote server computation stops after the local HTTP request is aborted.
 
 ### Listening States
 
@@ -266,12 +264,12 @@ Microphone data remains ignored during `PROCESSING`. This milestone does not int
 let state: ListeningState = "IDLE";
 ```
 
-| State        | Responsibility                                                               |
-| ------------ | ---------------------------------------------------------------------------- |
-| `IDLE`       | Wait for the wake word                                                       |
-| `LISTENING`  | Record the user's command                                                    |
-| `PROCESSING` | Transcribe, classify, and execute the request                                |
-| `SPEAKING`   | Deliver JARVIS's response (wake-word detection remains active for barge-in)  |
+| State        | Responsibility                                                              |
+| ------------ | --------------------------------------------------------------------------- |
+| `IDLE`       | Wait for the wake word                                                      |
+| `LISTENING`  | Record the user's command                                                   |
+| `PROCESSING` | Transcribe, classify, and execute the request                               |
+| `SPEAKING`   | Deliver JARVIS's response (wake-word detection remains active for barge-in) |
 
 Typical interaction:
 
@@ -281,7 +279,7 @@ Typical interaction:
 
 `SPEAKING → (Wake Word Detected) → LISTENING`
 
-The controller uses these states to determine how incoming microphone audio should be handled. Audio processing remains active during `SPEAKING` so users can interrupt JARVIS mid-sentence.
+The controller uses these states to determine how incoming microphone audio should be handled. Wake-word audio and VAD monitoring remain active during both `PROCESSING` and `SPEAKING`; command recording still appends microphone chunks only during `LISTENING`. A recognized wake word can transition either interruptible state back to `LISTENING` after invalidating the old command.
 
 ---
 
@@ -471,7 +469,7 @@ let idleSpeechDetected = false;
 | `vadSilentFrames`    | Counts consecutive silent frames                  |
 | `vadVoiceDetected`   | Indicates command speech was detected or inferred |
 | `VAD_SILENCE_FRAMES` | Sets the silence threshold to 50 frames           |
-| `idleSpeechDetected` | Indicates speech occurred while IDLE or SPEAKING   |
+| `idleSpeechDetected` | Indicates speech occurred while IDLE or SPEAKING  |
 
 When VAD detects voice during `LISTENING`, the silence counter resets to zero.
 
@@ -500,32 +498,25 @@ A `Buffer` contains raw bytes representing audio samples.
 ### When Audio Is Ignored
 
 ```ts
-if (
-  isShuttingDown ||
-  Date.now() < cooldownUntil ||
-  state === "PROCESSING"
-) {
-  return;
-}
+if (isShuttingDown || Date.now() < cooldownUntil) return;
 ```
 
 The handler returns early when:
 
 - JARVIS is shutting down.
 - The speech cooldown is active.
-- JARVIS is in `PROCESSING`.
 
-**Note:** Audio is **not** ignored during `SPEAKING`. Audio streaming and wake-word detection continue during speech playback to allow the user to interrupt JARVIS (barge-in).
+**Note:** Audio is not discarded merely because JARVIS is processing or speaking. Bounded wake/pending buffers and VAD continue to support interruption, while the active command buffer is written only during `LISTENING`.
 
 ### Wake-Word Detection State (`canDetectWakeWord`)
 
 ```ts
 const canDetectWakeWord = (): boolean => {
-  return state === "IDLE" || state === "SPEAKING";
+  return state === "IDLE" || state === "PROCESSING" || state === "SPEAKING";
 };
 ```
 
-Encapsulates the states where JARVIS listens for the wake word: while waiting idle or while speaking a response.
+Encapsulates wake-word monitoring while idle, processing a request, or speaking. `isTranscribing` prevents overlapping wake checks; VAD speech detection gates snapshot transcription.
 
 ### Buffering During Wake-Word Transcription
 
@@ -677,6 +668,11 @@ if (
   state === "LISTENING"
 ) {
   silenceHandled = true;
+  buffers.wake.length = 0;
+  buffers.pending.length = 0;
+  totalBytes = 0;
+  pendingBytes = 0;
+  idleSpeechDetected = false;
   state = "PROCESSING";
 
   processCommand().catch((error) =>
@@ -690,7 +686,7 @@ JARVIS processes a command when either:
 - Enough consecutive silence has been detected, or
 - The maximum listening duration has elapsed.
 
-Before starting `processCommand()`, it marks the silence event as handled and switches to `PROCESSING`.
+Before starting `processCommand()`, it marks the silence event as handled, clears wake/pending audio and their counters, clears the wake-speech flag, and switches to `PROCESSING`. The command buffer is preserved for transcription. New processing-time audio starts a fresh wake window instead of replaying the original request as an interruption.
 
 This prevents subsequent microphone events from repeatedly starting the same command.
 
@@ -700,18 +696,25 @@ This prevents subsequent microphone events from repeatedly starting the same com
 
 ### Overview
 
-Speech barge-in allows the user to say the wake word ("Jarvis") while JARVIS is actively speaking (`SPEAKING` state). Once the wake word is confirmed, the controller requests playback interruption and transitions directly into recording a new command (`LISTENING` state). Detection is not instantaneous: wake-word checks run approximately every second and require Whisper transcription.
+Wake-word interruption is supported while waiting on command processing (`PROCESSING`) and while speaking (`SPEAKING`). Recognition invalidates the old session, aborts its active requests, stops any Kokoro playback, and transitions to replacement-command recording (`LISTENING`). Detection is not instantaneous: wake-word checks run approximately every second and require Whisper transcription.
+
+“Jarvis, stop” follows that transition, then the normalized `stop` command returns without classification or response generation. Command-end detection and transcription still run before it returns to readiness. A replacement such as “Jarvis, what time is it?” is processed as a new command. Neither route undoes an OS action or memory write that already completed.
 
 ### Interruption Trigger
 
 ```ts
+// Captured before awaiting wake-snapshot transcription:
+const checkSessionId = sessionId;
+const checkState = state;
+
+// After transcription:
 if (
-  containsWakeWord(transcription, state === "SPEAKING") &&
+  containsWakeWord(transcription, checkState === "SPEAKING") &&
   canDetectWakeWord() &&
   !isShuttingDown &&
   checkSessionId === sessionId
 ) {
-  if (state === "SPEAKING") {
+  if (state === "PROCESSING" || state === "SPEAKING") {
     sessionId++;
     abortActiveRequest();
     stopKokoroPlayback();
@@ -730,12 +733,14 @@ if (
   // ...
 ```
 
-When the wake word is confirmed while `state === "SPEAKING"`:
+When the wake word is confirmed while processing or speaking:
 
 1. **`sessionId++` and `abortActiveRequest()`**: Invalidate the prior session and cancel its active provider requests; stale asynchronous results remain guarded by session checks.
 2. **`stopKokoroPlayback()`**: Increments Kokoro's separate `speechSession` counter so older speech cannot advance to another chunk. In native mode it sends STOP for pending playback IDs; in SoX mode it interrupts the active `afplay` process with `SIGTERM`.
 3. **Buffer reset**: Discards prior command audio and seeds the new command buffer with the captured wake-word audio and any pending chunks.
 4. **Immediate listening**: Switches `state = "LISTENING"` and records the user's new request without requiring an idle transition or cooldown.
+
+`containsWakeWord()` uses the captured `checkState` to choose its matching rule: snapshots captured during speech allow a wake word later in the transcript; idle/processing snapshots require it at the beginning. A model response starting speech while Whisper is still working must not retroactively loosen the processing snapshot's matching rule. Current wake-enabled state, shutdown, and `checkSessionId` checks still control whether the result applies. A stale result after session invalidation or shutdown cannot reopen listening.
 
 ### Guarding Command Processing (`commandSessionId`)
 
@@ -795,7 +800,7 @@ The wake buffer helps recognize "Jarvis"; the pending buffer preserves audio dur
 
 **Speech barge-in**
 
-Microphone audio and VAD monitoring remain active while JARVIS speaks (`canDetectWakeWord()`). When Whisper confirms the wake word during playback, JARVIS requests a stop via `stopKokoroPlayback()`, increments `sessionId` to obsolete the prior command flow, and begins collecting the new command without waiting for another idle cycle.
+Microphone audio and VAD monitoring remain active during processing and speech (`canDetectWakeWord()`). A confirmed wake word invalidates the previous command, aborts its requests, requests playback stop separately, and begins collecting the new command without waiting for an idle cycle.
 
 **Asynchronous execution**
 
@@ -887,7 +892,7 @@ This milestone improves ranked lexical retrieval; it does not introduce embeddin
 
 ## 16. Milestone 14 Validation Checkpoint
 
-`npm test` now executes `tsx --test src/tests/*.ts`: **36 tests pass**, comprising the 15 retrieval cases and 21 cancellation/recovery cases in `request-cancellation.ts`. The helper under `src/tests/helpers/request-harness.ts` evaluates the real provider functions with substituted OpenAI, fetch, speech, timeout signals, and a synthetic environment. It uses the installed esbuild transform and a VM context; the real OpenAI/TTS modules are not loaded by that harness. No saved user data, real credential values, audio, or external requests are used.
+At the Milestone 14 checkpoint, `npm test` executed `tsx --test src/tests/*.ts` with **36 passing tests**, comprising the 15 retrieval cases and 21 cancellation/recovery cases in `request-cancellation.ts`. The helper under `src/tests/helpers/request-harness.ts` evaluates the real provider functions with substituted OpenAI, fetch, speech, timeout signals, and a synthetic environment. It uses the installed esbuild transform and a VM context; the real OpenAI/TTS modules are not loaded by that harness. No saved user data, real credential values, audio, or external requests are used.
 
 For both classification and conversation, the suite verifies pre-aborted entry, cancellation during primary requests, late successful primary replies, cancellation during fallback fetch/body reads, and late fallback replies. It also checks that primary timeouts still allow local recovery, local timeouts remain errors rather than caller cancellation, API-access errors do not trigger fallback, and a later independent request succeeds after timeout. Conversation cancellation during speech does not append history.
 
@@ -895,4 +900,12 @@ Two additional race tests initially failed: classification logged and returned `
 
 Live shutdown during processing completed with worker and microphone cleanup and no late response, fallback warning, or command-processing error. A separate live speech-interruption check stopped the explanation, answered a new time request, and returned to readiness without resuming the old response. The source-level ownership and session cleanup paths were reviewed; the isolated test harness does not instantiate the complete voice controller or exercise real network cancellation.
 
-TypeScript and whitespace checks pass. New commands during `PROCESSING`, transcription cancellation, and remote-server cancellation guarantees remain outside this milestone. Existing speech interruption and session validity checks remain in place alongside HTTP cancellation.
+TypeScript and whitespace checks passed. New commands during `PROCESSING` were outside Milestone 14 and are added by Milestone 15 below. Transcription cancellation and remote-server cancellation guarantees remain outside both milestones.
+
+## 17. Milestone 15 Validation Checkpoint
+
+Live fallback-path tests verified “Jarvis, stop” during processing, followed by a successful time command; replacement of a processing explanation with a time request; normal completion without interruption; and existing speech barge-in without resuming the old answer. A partial transcription that did not contain a complete wake word was ignored. These checks exercise real recognition and playback in the user's environment, rather than guarantee a fixed interruption latency or success across all background noise.
+
+`src/tests/processing-interruption.ts` adds **7 controller tests**, bringing `npm test` to **43 cases**. `helpers/voice-harness.ts` evaluates the real controller with synthetic microphone events/VAD, queued transcripts, substituted commands/providers/speech, in-memory file operations, timers, and environment. It never starts the real microphone, Whisper, model clients, or storage. The tests cover processing stop/recovery, replacement during classification, fresh wake audio, ignoring speech without a wake word, captured-state matching across the processing-to-speaking race, stale transcription after shutdown, and old-command cleanup preserving a replacement's controller.
+
+This milestone enables recognition during processing; it does not make recognition instantaneous, cancel existing transcription subprocesses, or reverse completed side effects. Wake polling, VAD, Whisper latency, the three-second wake buffer, and the five-second pending buffer remain relevant operational limits.

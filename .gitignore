@@ -101,3 +101,6 @@ coverage/
 # OS / Runtime
 *.pid
 *.pid.lock
+
+# Arduino
+/src/arduino-tests/

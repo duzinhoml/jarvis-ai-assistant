@@ -431,17 +431,11 @@ export const startVoiceController = async (): Promise<void> => {
   const VAD_SILENCE_FRAMES = 50;
 
   const canDetectWakeWord = (): boolean => {
-    return state === "IDLE" || state === "SPEAKING";
+    return state === "IDLE" || state === "PROCESSING" || state === "SPEAKING";
   };
 
   child.stdout.on("data", (chunk: Buffer) => {
-    if (
-      isShuttingDown ||
-      Date.now() < cooldownUntil ||
-      state === "PROCESSING"
-    ) {
-      return;
-    }
+    if (isShuttingDown || Date.now() < cooldownUntil) return;
 
     if (isTranscribing && canDetectWakeWord()) {
       buffers.pending.push(chunk);
@@ -522,6 +516,12 @@ export const startVoiceController = async (): Promise<void> => {
       );
 
       silenceHandled = true;
+      buffers.wake.length = 0;
+      buffers.pending.length = 0;
+      totalBytes = 0;
+      pendingBytes = 0;
+      idleSpeechDetected = false;
+
       state = "PROCESSING";
       console.log(state);
       processCommand().catch((error) =>
@@ -545,6 +545,7 @@ export const startVoiceController = async (): Promise<void> => {
     idleSpeechDetected = false;
     isTranscribing = true;
     const checkSessionId = sessionId;
+    const checkState = state;
     buffers.pending.length = 0;
     pendingBytes = 0;
 
@@ -557,12 +558,12 @@ export const startVoiceController = async (): Promise<void> => {
       const wakeContainsCommand = cleanedWakeTranscription.length > 0;
 
       if (
-        containsWakeWord(transcription, state === "SPEAKING") &&
+        containsWakeWord(transcription, checkState === "SPEAKING") &&
         canDetectWakeWord() &&
         !isShuttingDown &&
         checkSessionId === sessionId
       ) {
-        if (state === "SPEAKING") {
+        if (state === "PROCESSING" || state === "SPEAKING") {
           sessionId++;
           abortActiveRequest();
           stopKokoroPlayback();

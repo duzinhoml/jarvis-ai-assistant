@@ -20,7 +20,7 @@ The long-term goal is to develop an increasingly autonomous assistant with conte
 - **Voice Activation:** Begin requests with “Jarvis,” “Hey Jarvis,” or “Hi Jarvis,” detected through local Whisper transcription.
 - **Terminal Feedback:** Display listening states, transcriptions, responses, and errors in the terminal.
 - **Text-to-Speech:** Generate spoken responses locally using Kokoro in a worker thread, with chunked playback through native VoiceProcessingIO. SoX mode uses macOS `afplay`; supported speech failures fall back to `say`.
-- **Speech Interruption:** Detect the wake word during Kokoro speech to interrupt playback and begin a new request.
+- **Voice Interruption:** Detect the wake word during model processing or Kokoro speech to cancel the pending interaction and begin a new request. “Jarvis, stop” cancels without requesting a replacement answer.
 - **Request Cancellation:** Share a per-command abort signal across primary and fallback model requests, cancelling obsolete work on session invalidation or shutdown without cancellation error speech.
 - **Speech Recording:** Capture microphone input through native VoiceProcessingIO and stream 16 kHz mono Int16 PCM to TypeScript, with SoX available as a manual fallback.
 - **Speech Recognition:** Transcribe recorded audio using Whisper.
@@ -201,7 +201,7 @@ The selected snapshot is wrapped as untrusted reference data in a request-only m
 
 Apple Music controls require an explicit target, such as “Jarvis, pause Apple Music.” They do not control the YouTube study playlist or other players.
 
-To check types without compiling, run `npx tsc --noEmit`. Run `npm test` for **36 isolated regression tests**: 15 memory-retrieval cases in `src/tests/memory-context.ts` and 21 cancellation/recovery cases in `src/tests/request-cancellation.ts`. The script runs `tsx --test src/tests/*.ts`; helpers are under `src/tests/helpers/`. These tests use synthetic data and substituted providers without reading saved memory, loading real credentials, starting audio, or making model requests. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
+To check types without compiling, run `npx tsc --noEmit`. Run `npm test` for **43 isolated regression tests**: 15 memory-retrieval cases in `src/tests/memory-context.ts`, 21 cancellation/recovery cases in `src/tests/request-cancellation.ts`, and 7 controller cases in `src/tests/processing-interruption.ts`. The script runs `tsx --test src/tests/*.ts`; helpers are under `src/tests/helpers/`. These tests use synthetic data and substituted providers without reading saved memory, loading real credentials, starting audio, or making model requests. Temporary forced-provider throws must be removed for primary-path tests to run as intended. The native helper also provides offline self-tests that do not start microphone capture or speaker playback:
 
 ```bash
 swift native/audio/main.swift --test-streaming-buffer
@@ -223,7 +223,9 @@ Each command owns an `AbortController`, and both model stages receive its signal
 
 Cancelled classification returns `CANCELLED` without executing a command. Cancelled conversation returns `null` without speaking a late answer or saving the exchange. Checks cover entry, provider errors, successful late results, and post-speech history updates. The controller retains session guards and clears its active-controller reference only when the finishing command still owns it. Fallback warnings identify whether classification or response generation switched providers. The local model remains less reliable at following learning preferences than the primary model.
 
-New microphone input is still ignored during `PROCESSING`; wake-word interruption is available during speech, not while waiting for a model. Request cancellation does not cancel Whisper transcription, undo completed commands or memory writes, or guarantee that a remote server stops computation. Kokoro playback is stopped separately from network cancellation.
+Wake-word monitoring now continues during `PROCESSING` as well as `IDLE` and `SPEAKING`. Processing starts with cleared wake/pending buffers so the original command audio is not reused as an interruption. Once a new wake word is recognized during processing or speech, JARVIS invalidates the old session, aborts its requests, and listens for the replacement command. “Jarvis, stop” uses the existing stop route to return to readiness without a model request. Detection still depends on VAD, periodic wake checks, Whisper transcription, and command-end detection; it is not instantaneous. Plain background speech without a recognized wake word does not replace the request.
+
+The wake snapshot captures its state and session before transcription. Matching uses that captured state, while current-state, session, and shutdown checks decide whether the result can still apply. Request cancellation does not cancel Whisper transcription, undo completed commands or memory writes, or guarantee that a remote server stops computation. Kokoro playback is stopped separately from network cancellation.
 
 History saves run through a serialized Promise queue using snapshots. Each save writes a unique temporary file beside the destination and renames it into place; failed writes or renames attempt temporary-file cleanup while preserving the original error. This prevents partial-file replacement during normal operation. It does not provide coordination between multiple concurrently running JARVIS instances or guaranteed durability through a power failure.
 
@@ -274,6 +276,7 @@ Executes approved actions through macOS utilities and AppleScript, including app
 - [x] Rank memory by current-request relevance, pack the context budget, normalize spelling aliases, and support bounded follow-ups with regression tests.
 - [x] Add OpenAI classification and conversation with validated routing and local Ollama fallback.
 - [x] Cancel obsolete primary/fallback model requests and distinguish intentional cancellation from timeout/error recovery.
+- [x] Recognize wake-word stop/replacement requests during processing, preserving speech interruption and guarding late wake results.
 - [ ] Integrate Arduino-based hardware.
 - [ ] Explore custom model fine-tuning and training.
 
@@ -322,6 +325,8 @@ Milestone 12 adds bounded, request-specific memory context and OpenAI primary cl
 Milestone 13 improves retrieval with current-request-first scoring, stable ties, skip-and-continue budget packing, spelling aliases, broader teaching cues, and limited previous-request context. Live trials verified a rover-color follow-up, a switch to teaching promises without rover references, and conversational continuity on a later promises follow-up. Isolated integration checks separately verified the request-only memory snapshot. A crowded-memory edge case initially excluded the answer behind ten old-subject matches; revised scoring fixes it and has a regression test. All 15 `npm test` cases, TypeScript, and whitespace checks pass. General semantic retrieval and multi-turn subject tracking remain future work.
 
 Milestone 14 adds per-command request cancellation, ownership-safe cleanup, quiet cancelled results, and combined fallback timeout/cancellation signals. Live checks passed shutdown during processing without a late answer or error, and speech interruption followed by a new time command. All 36 tests, TypeScript, and whitespace checks pass. Simulated cancellation tests cover both providers, late replies, body reads, speech/history protection, timeouts, and recovery on a later request. Two late classification-fallback error races were reproduced and fixed. Full voice-controller lifecycle behavior was reviewed and exercised live, rather than covered by the isolated provider test harness.
+
+Milestone 15 enables processing-time wake-word stop and replacement with fresh interruption audio and captured-state matching. Live tests passed processing stop followed by a time request, replacement during processing, normal uninterrupted completion, and existing speech interruption. These live checks used the local fallback during development. The seven new controller tests exercise the real controller with simulated audio/transcription/providers, including stale wake results, state changes during transcription, and old-command cleanup. All 43 tests passed with temporary forced-fallback throws removed; TypeScript and whitespace checks passed. Recognition latency and transcription resource use remain environment-dependent.
 
 JARVIS is an ongoing personal project. Features, architecture, and dependencies may change as development progresses.
 
